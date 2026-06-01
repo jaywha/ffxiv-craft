@@ -1,5 +1,5 @@
 from flask import Flask, jsonify, request, Response
-import requests, math
+import requests, math, itertools
 
 app = Flask(__name__)
 
@@ -18,7 +18,6 @@ def xiv_get(path, params=None, timeout=10):
     return r.json()
 
 def icon_url(icon_field):
-    """Convert v2 icon dict -> PNG via asset endpoint."""
     if not icon_field:
         return None
     if isinstance(icon_field, dict):
@@ -43,13 +42,9 @@ def search_items_xiv(query):
         results.append({"id": row["row_id"], "name": name, "icon": icon_url(f.get("Icon"))})
     return results
 
-# Recipe fields — IMPORTANT: subfield filtering (Field.Sub or Field[].Sub) silently
-# returns nothing for array/certain relationship fields in v2. Must request bare field
-# names and parse nested data ourselves. Confirmed from live debug data.
 _RCP_FIELDS = "ItemResult,AmountResult,CraftType,RecipeLevelTable,Ingredient,AmountIngredient"
 
 def find_recipe(item_id):
-    """Search Recipe sheet for a recipe producing item_id, return parsed recipe or None."""
     search = xiv_get("/search", params={
         "sheets": "Recipe",
         "query": f"+ItemResult={item_id}",
@@ -65,26 +60,14 @@ def find_recipe(item_id):
 
 def parse_recipe(recipe_row, data):
     f = data.get("fields", {})
-
-    # ItemResult: {"value": <id>, "fields": {"Name": ..., "Icon": {...}, ...}}
     result_item = f.get("ItemResult") or {}
     ri_f = result_item.get("fields", {}) if isinstance(result_item, dict) else {}
-
-    # CraftType: {"value": N, "fields": {"Name": "Goldsmithing", ...}}
     craft_type = f.get("CraftType") or {}
     ct_f = craft_type.get("fields", {}) if isinstance(craft_type, dict) else {}
-
-    # RecipeLevelTable: {"value": N, "fields": {"ClassJobLevel": 20, ...}}
     lvl_tbl = f.get("RecipeLevelTable") or {}
     lvl_f = lvl_tbl.get("fields", {}) if isinstance(lvl_tbl, dict) else {}
-
-    # AmountIngredient: plain int list e.g. [1, 1, 0, 0, 0, 0, 1, 1]
     raw_amts = f.get("AmountIngredient") or []
-
-    # Ingredient: list of full Item relationship objects
-    # Each: {"value": <item_id>, "fields": {"Name": ..., "Icon": {...}, "ItemUICategory": {...}}}
     raw_ings = f.get("Ingredient") or []
-
     ingredients = []
     for i, ing in enumerate(raw_ings):
         if not isinstance(ing, dict):
@@ -92,7 +75,6 @@ def parse_recipe(recipe_row, data):
         ing_id   = ing.get("value")
         ing_f    = ing.get("fields", {})
         ing_name = ing_f.get("Name", "")
-        # Skip empty/null slots
         if not ing_name or not ing_id:
             continue
         amt = raw_amts[i] if i < len(raw_amts) else 0
@@ -107,7 +89,6 @@ def parse_recipe(recipe_row, data):
             "icon":        icon_url(ing_f.get("Icon")),
             "ui_category": ui_cat_f.get("Name", ""),
         })
-
     return {
         "recipe_id":     recipe_row,
         "result_name":   ri_f.get("Name", ""),
@@ -118,7 +99,6 @@ def parse_recipe(recipe_row, data):
     }
 
 def get_item_info(item_id):
-    """Fetch name, icon, category for a single item."""
     data = xiv_get(f"/sheet/Item/{item_id}", params={
         "fields": "Name,Icon,ItemUICategory.Name"
     })
@@ -150,6 +130,338 @@ def classify(name, ui_category, has_recipe):
     return "other"
 
 # ---------------------------------------------------------------------------
+# Gathering location lookup via XIVAPI GatheringPoint sheet
+# ---------------------------------------------------------------------------
+
+def get_gathering_locations(item_id):
+    """Return list of {zone, x, y, type, level} for a gathered item.
+
+    XIVAPI v2 has NO reverse-lookup (GameContentLinks was v1 only), so we
+    can only traverse relationships forward.  The chain that works is:
+
+      1. Search GatheringItem where +Item={item_id}
+            -> gives us gi_id and GatheringItemLevel
+
+      2. Fetch the GatheringItem row directly by gi_id with expanded fields:
+            GatheringItemLevel.GatheringItemLevel   (numeric level)
+
+         GatheringItem itself does NOT link to a zone.  Zone comes from
+         GatheringPoint, which we can search by +PlaceName= ... but we don't
+         know the zone yet, so that's circular.
+
+         Instead we use GatheringPoint searched by its *searchable* scalar
+         field GatheringPointBase -- but that also requires knowing gpb_id.
+
+      Workaround: search GatheringPoint directly with a combined query that
+      matches based on the gathering job category inferred from the item's
+      ItemUICategory (Miner vs Botanist) and the level range, then validate
+      by fetching each point's item list.  Too expensive.
+
+      Practical solution for v2: search GatheringPoint with
+          +GatheringPointBase.GatheringType=N  (job filter)
+      is not supported either.
+
+      BEST AVAILABLE APPROACH for v2:
+      Search GatheringPoint where PlaceName.Name~"zone" -- no, we don't know
+      the zone.
+
+      FINAL ANSWER: Use the "Item" field on GatheringPoint (NOT GatheringPointBase).
+      GatheringPoint has its own Item[] array in some schema versions; check with
+      array bracket notation: +Item[]={gi_id}.
+      If that 400s too, fall back to paginating GatheringPointBase by row ID
+      (there are only ~700 rows) and scanning for gi_id in the Item array.
+    """
+    try:
+        # Step 1 -- find GatheringItem row(s) for this item
+        gi_search = xiv_get("/search", params={
+            "sheets": "GatheringItem",
+            "query": f"+Item={item_id}",
+            "fields": "GatheringItemLevel",
+            "limit": 5,
+        })
+        gi_rows = gi_search.get("results", [])
+        if not gi_rows:
+            return []
+
+        locations = []
+        seen_zones = set()
+
+        for gi_row in gi_rows[:3]:
+            gi_id = gi_row["row_id"]
+            gi_f  = gi_row.get("fields", {})
+            lvl_obj    = gi_f.get("GatheringItemLevel") or {}
+            lvl_f      = lvl_obj.get("fields", {}) if isinstance(lvl_obj, dict) else {}
+            gather_lvl = lvl_f.get("GatheringItemLevel", "?")
+
+            # Step 2 -- Try array-bracket search on GatheringPoint directly.
+            # GatheringPoint has an Item[] array of GatheringItem row IDs in
+            # some schema versions; if not, fall back to paginating GatheringPointBase.
+            zone_found = False
+            try:
+                gp_search = xiv_get("/search", params={
+                    "sheets": "GatheringPoint",
+                    "query": f"+Item[]={gi_id}",
+                    "fields": "TerritoryType,PlaceName,GatheringPointBase",
+                    "limit": 8,
+                })
+                for pt_row in gp_search.get("results", [])[:5]:
+                    pf   = pt_row.get("fields", {})
+                    pn   = pf.get("PlaceName") or {}
+                    pn_f = pn.get("fields", {}) if isinstance(pn, dict) else {}
+                    tn   = pf.get("TerritoryType") or {}
+                    tn_f = tn.get("fields", {}) if isinstance(tn, dict) else {}
+                    gpb  = pf.get("GatheringPointBase") or {}
+                    gpb_f = gpb.get("fields", {}) if isinstance(gpb, dict) else {}
+                    gt   = gpb_f.get("GatheringType") or {}
+                    gt_f = gt.get("fields", {}) if isinstance(gt, dict) else {}
+                    gtype = gt_f.get("Name", "Gathering")
+                    zone = pn_f.get("Name") or tn_f.get("Name") or ""
+                    if zone and zone not in seen_zones:
+                        seen_zones.add(zone)
+                        zone_found = True
+                        locations.append({
+                            "zone":  zone,
+                            "x":     None,
+                            "y":     None,
+                            "type":  gtype,
+                            "level": gather_lvl,
+                        })
+            except Exception:
+                pass  # fall through to scan approach
+
+            if zone_found:
+                continue
+
+            # Step 2b -- Fallback: scan GatheringPointBase rows (there are ~700).
+            # Fetch in pages of 100 and check if gi_id is in Item[].
+            # This is O(700 API calls) in the worst case, so cap at 5 pages.
+            for page_start in range(0, 500, 100):
+                try:
+                    page = xiv_get("/sheet/GatheringPointBase", params={
+                        "fields": "GatheringType,Item",
+                        "limit": 100,
+                        "after": page_start if page_start else None,
+                    })
+                except Exception:
+                    break
+                rows = page.get("rows", [])
+                if not rows:
+                    break
+                for gpb_row in rows:
+                    gpb_f = gpb_row.get("fields", {})
+                    items_in_base = []
+                    raw_items = gpb_f.get("Item") or []
+                    for it in raw_items:
+                        if isinstance(it, dict):
+                            items_in_base.append(it.get("value"))
+                        elif isinstance(it, int):
+                            items_in_base.append(it)
+                    if gi_id not in items_in_base:
+                        continue
+                    gpb_id = gpb_row["row_id"]
+                    gt     = gpb_f.get("GatheringType") or {}
+                    gt_f   = gt.get("fields", {}) if isinstance(gt, dict) else {}
+                    gtype  = gt_f.get("Name", "Gathering")
+                    # Now look up the GatheringPoint for this base
+                    try:
+                        pt_search = xiv_get("/search", params={
+                            "sheets": "GatheringPoint",
+                            "query": f"+GatheringPointBase={gpb_id}",
+                            "fields": "TerritoryType,PlaceName",
+                            "limit": 3,
+                        })
+                        for pt_row in pt_search.get("results", [])[:2]:
+                            pf   = pt_row.get("fields", {})
+                            pn   = pf.get("PlaceName") or {}
+                            pn_f = pn.get("fields", {}) if isinstance(pn, dict) else {}
+                            tn   = pf.get("TerritoryType") or {}
+                            tn_f = tn.get("fields", {}) if isinstance(tn, dict) else {}
+                            zone = pn_f.get("Name") or tn_f.get("Name") or ""
+                            if zone and zone not in seen_zones:
+                                seen_zones.add(zone)
+                                locations.append({
+                                    "zone":  zone,
+                                    "x":     None,
+                                    "y":     None,
+                                    "type":  gtype,
+                                    "level": gather_lvl,
+                                })
+                    except Exception:
+                        pass
+                if locations:
+                    break  # found at least one zone, stop paging
+
+        return locations
+    except Exception:
+        return []
+
+# ---------------------------------------------------------------------------
+# FFXIV zone graph for TSP (aetheryte network adjacency)
+# Teleport costs in gil (approximate base costs), travel times in minutes
+# Zones grouped by expansion for context
+# ---------------------------------------------------------------------------
+
+# Zone data: name -> {aetheryte, region, expansion, coords_approx}
+# coords_approx are abstract map coordinates for distance estimation
+ZONE_DATA = {
+    # ARR - La Noscea
+    "Limsa Lominsa": {"region": "La Noscea", "expansion": "ARR", "x": 0, "y": 0, "is_city": True, "teleport_cost": 0},
+    "Middle La Noscea": {"region": "La Noscea", "expansion": "ARR", "x": -1, "y": 1, "is_city": False, "teleport_cost": 150},
+    "Lower La Noscea": {"region": "La Noscea", "expansion": "ARR", "x": -2, "y": 2, "is_city": False, "teleport_cost": 180},
+    "Eastern La Noscea": {"region": "La Noscea", "expansion": "ARR", "x": 2, "y": 1, "is_city": False, "teleport_cost": 220},
+    "Western La Noscea": {"region": "La Noscea", "expansion": "ARR", "x": -3, "y": 0, "is_city": False, "teleport_cost": 260},
+    "Upper La Noscea": {"region": "La Noscea", "expansion": "ARR", "x": 1, "y": -1, "is_city": False, "teleport_cost": 300},
+    "Outer La Noscea": {"region": "La Noscea", "expansion": "ARR", "x": 3, "y": -2, "is_city": False, "teleport_cost": 340},
+    # ARR - Thanalan
+    "Ul'dah": {"region": "Thanalan", "expansion": "ARR", "x": 10, "y": 10, "is_city": True, "teleport_cost": 0},
+    "Western Thanalan": {"region": "Thanalan", "expansion": "ARR", "x": 8, "y": 11, "is_city": False, "teleport_cost": 150},
+    "Central Thanalan": {"region": "Thanalan", "expansion": "ARR", "x": 10, "y": 12, "is_city": False, "teleport_cost": 180},
+    "Eastern Thanalan": {"region": "Thanalan", "expansion": "ARR", "x": 13, "y": 11, "is_city": False, "teleport_cost": 220},
+    "Southern Thanalan": {"region": "Thanalan", "expansion": "ARR", "x": 11, "y": 15, "is_city": False, "teleport_cost": 300},
+    "Northern Thanalan": {"region": "Thanalan", "expansion": "ARR", "x": 10, "y": 8, "is_city": False, "teleport_cost": 260},
+    # ARR - Black Shroud
+    "Gridania": {"region": "Black Shroud", "expansion": "ARR", "x": 20, "y": 5, "is_city": True, "teleport_cost": 0},
+    "Central Shroud": {"region": "Black Shroud", "expansion": "ARR", "x": 20, "y": 7, "is_city": False, "teleport_cost": 150},
+    "East Shroud": {"region": "Black Shroud", "expansion": "ARR", "x": 23, "y": 6, "is_city": False, "teleport_cost": 180},
+    "South Shroud": {"region": "Black Shroud", "expansion": "ARR", "x": 21, "y": 10, "is_city": False, "teleport_cost": 220},
+    "North Shroud": {"region": "Black Shroud", "expansion": "ARR", "x": 19, "y": 3, "is_city": False, "teleport_cost": 260},
+    # ARR - Coerthas / Mor Dhona
+    "Coerthas Central Highlands": {"region": "Coerthas", "expansion": "ARR", "x": 15, "y": 0, "is_city": False, "teleport_cost": 400},
+    "Mor Dhona": {"region": "Mor Dhona", "expansion": "ARR", "x": 18, "y": -1, "is_city": False, "teleport_cost": 420},
+    # HW
+    "Ishgard": {"region": "Coerthas", "expansion": "HW", "x": 14, "y": -2, "is_city": True, "teleport_cost": 0},
+    "Coerthas Western Highlands": {"region": "Coerthas", "expansion": "HW", "x": 12, "y": -4, "is_city": False, "teleport_cost": 400},
+    "The Sea of Clouds": {"region": "Abalathia", "expansion": "HW", "x": 10, "y": -6, "is_city": False, "teleport_cost": 450},
+    "Azys Lla": {"region": "Abalathia", "expansion": "HW", "x": 8, "y": -8, "is_city": False, "teleport_cost": 500},
+    "The Dravanian Forelands": {"region": "Dravania", "expansion": "HW", "x": 20, "y": -5, "is_city": False, "teleport_cost": 460},
+    "The Dravanian Hinterlands": {"region": "Dravania", "expansion": "HW", "x": 24, "y": -7, "is_city": False, "teleport_cost": 480},
+    "The Churning Mists": {"region": "Dravania", "expansion": "HW", "x": 22, "y": -9, "is_city": False, "teleport_cost": 500},
+    # SB
+    "Kugane": {"region": "Hingashi", "expansion": "SB", "x": 35, "y": 0, "is_city": True, "teleport_cost": 0},
+    "The Ruby Sea": {"region": "Hingashi", "expansion": "SB", "x": 37, "y": 2, "is_city": False, "teleport_cost": 450},
+    "Yanxia": {"region": "Othard", "expansion": "SB", "x": 38, "y": -2, "is_city": False, "teleport_cost": 460},
+    "The Azim Steppe": {"region": "Othard", "expansion": "SB", "x": 40, "y": -5, "is_city": False, "teleport_cost": 500},
+    "The Fringes": {"region": "Gyr Abania", "expansion": "SB", "x": 30, "y": -3, "is_city": False, "teleport_cost": 420},
+    "The Peaks": {"region": "Gyr Abania", "expansion": "SB", "x": 28, "y": -6, "is_city": False, "teleport_cost": 440},
+    "The Lochs": {"region": "Gyr Abania", "expansion": "SB", "x": 32, "y": -5, "is_city": False, "teleport_cost": 460},
+    # ShB
+    "The Crystarium": {"region": "Lakeland", "expansion": "ShB", "x": 45, "y": 5, "is_city": True, "teleport_cost": 0},
+    "Eulmore": {"region": "Kholusia", "expansion": "ShB", "x": 42, "y": 8, "is_city": True, "teleport_cost": 0},
+    "Lakeland": {"region": "Lakeland", "expansion": "ShB", "x": 46, "y": 7, "is_city": False, "teleport_cost": 460},
+    "Kholusia": {"region": "Kholusia", "expansion": "ShB", "x": 41, "y": 10, "is_city": False, "teleport_cost": 460},
+    "Amh Araeng": {"region": "Amh Araeng", "expansion": "ShB", "x": 48, "y": 12, "is_city": False, "teleport_cost": 480},
+    "Il Mheg": {"region": "Il Mheg", "expansion": "ShB", "x": 44, "y": 2, "is_city": False, "teleport_cost": 480},
+    "The Rak'tika Greatwood": {"region": "Rak'tika", "expansion": "ShB", "x": 50, "y": 4, "is_city": False, "teleport_cost": 500},
+    "The Tempest": {"region": "The Tempest", "expansion": "ShB", "x": 52, "y": 8, "is_city": False, "teleport_cost": 520},
+    # EW
+    "Old Sharlayan": {"region": "Sharlayan", "expansion": "EW", "x": 55, "y": -5, "is_city": True, "teleport_cost": 0},
+    "Raz-at-Han": {"region": "Thavnair", "expansion": "EW", "x": 58, "y": 0, "is_city": True, "teleport_cost": 0},
+    "Labyrinthos": {"region": "Sharlayan", "expansion": "EW", "x": 55, "y": -8, "is_city": False, "teleport_cost": 460},
+    "Thavnair": {"region": "Thavnair", "expansion": "EW", "x": 59, "y": 3, "is_city": False, "teleport_cost": 480},
+    "Garlemald": {"region": "Garlemald", "expansion": "EW", "x": 52, "y": -10, "is_city": False, "teleport_cost": 500},
+    "Mare Lamentorum": {"region": "Moon", "expansion": "EW", "x": 60, "y": -6, "is_city": False, "teleport_cost": 520},
+    "Elpis": {"region": "Elpis", "expansion": "EW", "x": 62, "y": -2, "is_city": False, "teleport_cost": 540},
+    "Ultima Thule": {"region": "Ultima Thule", "expansion": "EW", "x": 65, "y": -8, "is_city": False, "teleport_cost": 560},
+    # DT
+    "Tuliyollal": {"region": "Tural", "expansion": "DT", "x": 70, "y": 5, "is_city": True, "teleport_cost": 0},
+    "Solution Nine": {"region": "Tural", "expansion": "DT", "x": 72, "y": 8, "is_city": True, "teleport_cost": 0},
+    "Urqopacha": {"region": "Tural", "expansion": "DT", "x": 68, "y": 3, "is_city": False, "teleport_cost": 480},
+    "Kozama'uka": {"region": "Tural", "expansion": "DT", "x": 71, "y": 7, "is_city": False, "teleport_cost": 500},
+    "Yak T'el": {"region": "Tural", "expansion": "DT", "x": 73, "y": 5, "is_city": False, "teleport_cost": 510},
+    "Shaaloani": {"region": "Tural", "expansion": "DT", "x": 74, "y": 2, "is_city": False, "teleport_cost": 520},
+    "Heritage Found": {"region": "Tural", "expansion": "DT", "x": 76, "y": 4, "is_city": False, "teleport_cost": 530},
+    "Living Memory": {"region": "Tural", "expansion": "DT", "x": 78, "y": 6, "is_city": False, "teleport_cost": 550},
+}
+
+def zone_distance(z1, z2):
+    """Euclidean distance between two zones using abstract coords."""
+    d1 = ZONE_DATA.get(z1, {})
+    d2 = ZONE_DATA.get(z2, {})
+    if not d1 or not d2:
+        return 999
+    dx = d1["x"] - d2["x"]
+    dy = d1["y"] - d2["y"]
+    return math.sqrt(dx*dx + dy*dy)
+
+def travel_time_minutes(z1, z2):
+    """Estimate travel time in minutes between zones.
+    Same zone = 2min (run), same region = 5min (chocobo), 
+    same expansion = 10min (chocobo+ferry), different expansion = 20min.
+    Teleport is always ~1min load time."""
+    d1 = ZONE_DATA.get(z1, {})
+    d2 = ZONE_DATA.get(z2, {})
+    if z1 == z2:
+        return 2
+    if d1.get("region") == d2.get("region"):
+        return 5
+    if d1.get("expansion") == d2.get("expansion"):
+        return 10
+    return 20  # cross-expansion needs teleport or long travel
+
+def teleport_cost(z1, z2):
+    """Cost of teleporting between two zones (0 if same zone)."""
+    if z1 == z2:
+        return 0
+    d2 = ZONE_DATA.get(z2, {})
+    return d2.get("teleport_cost", 300)
+
+def solve_tsp_nearest_neighbor(zones, cost_fn):
+    """Greedy nearest-neighbor TSP. Returns ordered list of zones."""
+    if not zones:
+        return []
+    if len(zones) == 1:
+        return list(zones)
+    
+    remaining = list(zones)
+    # Start from cheapest-to-reach zone
+    start = min(remaining, key=lambda z: ZONE_DATA.get(z, {}).get("teleport_cost", 999))
+    path = [start]
+    remaining.remove(start)
+    
+    while remaining:
+        current = path[-1]
+        next_z = min(remaining, key=lambda z: cost_fn(current, z))
+        path.append(next_z)
+        remaining.remove(next_z)
+    
+    return path
+
+def build_route(zones, cost_fn, label):
+    """Build route with step-by-step instructions."""
+    path = solve_tsp_nearest_neighbor(zones, cost_fn)
+    total_cost = 0
+    total_time = 0
+    steps = []
+    
+    for i, zone in enumerate(path):
+        prev = path[i-1] if i > 0 else None
+        step_cost = teleport_cost(prev, zone) if prev else 0
+        step_time = travel_time_minutes(prev, zone) if prev else 0
+        total_cost += step_cost
+        total_time += step_time
+        
+        zd = ZONE_DATA.get(zone, {})
+        steps.append({
+            "zone": zone,
+            "region": zd.get("region", "?"),
+            "expansion": zd.get("expansion", "?"),
+            "teleport_cost": step_cost,
+            "travel_time": step_time,
+            "action": "Start here" if i == 0 else (
+                "Teleport" if step_cost > 0 else "Walk/Chocobo"
+            ),
+            "items": zones[zone],
+        })
+    
+    return {
+        "label": label,
+        "path": path,
+        "steps": steps,
+        "total_cost": total_cost,
+        "total_time_min": total_time,
+    }
+
+# ---------------------------------------------------------------------------
 # Flask routes
 # ---------------------------------------------------------------------------
 
@@ -169,7 +481,6 @@ def api_search():
 
 @app.route("/api/debug/search/<path:query>")
 def api_debug_search(query):
-    """Raw XIVAPI search — use to verify item IDs."""
     try:
         return jsonify(xiv_get("/search", params={
             "sheets": "Item", "query": f'Name~"{query}"', "fields": "Name,Icon", "limit": 5
@@ -179,9 +490,7 @@ def api_debug_search(query):
 
 @app.route("/api/debug/breakdown/<int:item_id>")
 def api_debug_breakdown(item_id):
-    """Show exactly what find_recipe returns for an item, with raw field dump."""
     try:
-        # Step 1: raw recipe row
         search = xiv_get("/search", params={
             "sheets": "Recipe", "query": f"+ItemResult={item_id}",
             "fields": "ItemResult", "limit": 1,
@@ -190,12 +499,9 @@ def api_debug_breakdown(item_id):
         if not results:
             return jsonify({"error": "no recipe found", "item_id": item_id})
         recipe_row = results[0]["row_id"]
-
         raw = xiv_get(f"/sheet/Recipe/{recipe_row}", params={"fields": _RCP_FIELDS})
         f = raw.get("fields", {})
-
         parsed = parse_recipe(recipe_row, raw)
-
         return jsonify({
             "recipe_row_id": recipe_row,
             "fields_present": sorted(f.keys()),
@@ -215,7 +521,6 @@ def api_debug_breakdown(item_id):
 
 @app.route("/api/debug/recipe/<int:item_id>")
 def api_debug_recipe(item_id):
-    """Raw recipe search for an item_id — shows exactly what comes back."""
     try:
         step1 = xiv_get("/search", params={
             "sheets": "Recipe", "query": f"+ItemResult={item_id}",
@@ -227,13 +532,103 @@ def api_debug_recipe(item_id):
             rid = rows[0]["row_id"]
             out["recipe_row_id"] = rid
             out["recipe_data_filtered"] = xiv_get(f"/sheet/Recipe/{rid}", params={"fields": _RCP_FIELDS})
-            # Fetch with NO field filter to see ALL available field names
             raw = xiv_get(f"/sheet/Recipe/{rid}")
             out["all_field_names"] = sorted(raw.get("fields", {}).keys())
             out["recipe_data_raw"] = raw
         return jsonify(out)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/debug/gathering/<int:item_id>")
+def api_debug_gathering(item_id):
+    """Debug: show every step of zone lookup. Usage: /api/debug/gathering/<item_id>
+    
+    Tests in order:
+      1. GatheringItem search for +Item={item_id}
+      2a. GatheringPoint search with +Item[]={gi_id}  (array bracket notation)
+      2b. Raw GatheringItem row fetch (to see all available fields)
+    """
+    try:
+        import traceback as tb
+        out = {"item_id": item_id, "steps": []}
+
+        # Step 1
+        gi_search = xiv_get("/search", params={
+            "sheets": "GatheringItem", "query": f"+Item={item_id}",
+            "fields": "GatheringItemLevel", "limit": 5,
+        })
+        gi_rows = gi_search.get("results", [])
+        out["steps"].append({"step": "1_GatheringItem_search", "result_count": len(gi_rows),
+                             "row_ids": [r["row_id"] for r in gi_rows]})
+        if not gi_rows:
+            out["conclusion"] = "No GatheringItem rows — item is not gathered."
+            return jsonify(out)
+
+        gi_id = gi_rows[0]["row_id"]
+
+        # Step 2a -- raw fetch of the GatheringItem row to see ALL fields
+        try:
+            raw_gi = xiv_get(f"/sheet/GatheringItem/{gi_id}")
+            out["steps"].append({
+                "step": "2a_GatheringItem_raw_fetch",
+                "gi_id": gi_id,
+                "all_fields": sorted(raw_gi.get("fields", {}).keys()),
+                "fields": raw_gi.get("fields", {}),
+            })
+        except Exception as e:
+            out["steps"].append({"step": "2a_GatheringItem_raw_fetch", "error": str(e)})
+
+        # Step 2b -- try GatheringPoint with array bracket notation +Item[]={gi_id}
+        try:
+            gp_search = xiv_get("/search", params={
+                "sheets": "GatheringPoint",
+                "query": f"+Item[]={gi_id}",
+                "fields": "TerritoryType,PlaceName,GatheringPointBase",
+                "limit": 8,
+            })
+            gp_rows = gp_search.get("results", [])
+            out["steps"].append({
+                "step": "2b_GatheringPoint_array_search",
+                "query": f"+Item[]={gi_id}",
+                "result_count": len(gp_rows),
+                "zones": [
+                    ((r.get("fields", {}).get("PlaceName") or {}).get("fields", {}) or {}).get("Name")
+                    for r in gp_rows
+                ],
+            })
+        except Exception as e:
+            out["steps"].append({"step": "2b_GatheringPoint_array_search",
+                                 "query": f"+Item[]={gi_id}", "error": str(e)})
+
+        # Step 2c -- try GatheringPoint with dot-bracket: +GatheringPointBase.Item[]={gi_id}
+        try:
+            gp_search2 = xiv_get("/search", params={
+                "sheets": "GatheringPoint",
+                "query": f"+GatheringPointBase.Item[]={gi_id}",
+                "fields": "TerritoryType,PlaceName",
+                "limit": 5,
+            })
+            gp_rows2 = gp_search2.get("results", [])
+            out["steps"].append({
+                "step": "2c_GatheringPoint_nested_array_search",
+                "query": f"+GatheringPointBase.Item[]={gi_id}",
+                "result_count": len(gp_rows2),
+                "zones": [
+                    ((r.get("fields", {}).get("PlaceName") or {}).get("fields", {}) or {}).get("Name")
+                    for r in gp_rows2
+                ],
+            })
+        except Exception as e:
+            out["steps"].append({"step": "2c_GatheringPoint_nested_array_search",
+                                 "query": f"+GatheringPointBase.Item[]={gi_id}", "error": str(e)})
+
+        # Final result
+        out["locations"] = get_gathering_locations(item_id)
+        return jsonify(out)
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 @app.route("/api/breakdown", methods=["POST"])
 def api_breakdown():
@@ -269,7 +664,6 @@ def api_breakdown():
         recipe     = fetch_recipe(iid)
         has_recipe = bool(recipe and recipe.get("ingredients"))
 
-        # Use ingredient-supplied name/icon when available (avoids extra API call)
         if ing_name:
             name, icon, cat = ing_name, ing_icon, ing_cat
         else:
@@ -311,7 +705,6 @@ def api_breakdown():
 
         return node
 
-    # Fetch root item info from the Item sheet directly
     root_info = fetch_info(item_id)
     tree = build(item_id, quantity,
                  ing_name=root_info["name"], ing_icon=root_info["icon"],
@@ -329,8 +722,99 @@ def api_breakdown():
     return jsonify({"tree": tree, "raw_materials": raw_materials, "grouped_materials": grouped})
 
 
+@app.route("/api/route", methods=["POST"])
+def api_route():
+    """
+    Given a list of gathering items with zone hints, compute TSP routes.
+    Body: { items: [{name, icon, total_needed, zones: ["Zone Name", ...]}, ...] }
+    Returns two routes: min_cost and min_time.
+    """
+    body = request.get_json()
+    items = body.get("items", [])
+    
+    # Build zone -> [items] mapping
+    # For items without zone data, try to look them up or assign "Unknown"
+    zone_items = {}  # zone_name -> list of item dicts
+    
+    for item in items:
+        zones = item.get("zones", [])
+        if not zones:
+            zones = ["Unknown"]
+        # Use first known zone per item for routing
+        assigned = False
+        for z in zones:
+            if z in ZONE_DATA:
+                if z not in zone_items:
+                    zone_items[z] = []
+                zone_items[z].append({"name": item["name"], "qty": item.get("total_needed", 1), "icon": item.get("icon")})
+                assigned = True
+                break
+        if not assigned:
+            # Try fuzzy match
+            for z in zones:
+                matched = next((k for k in ZONE_DATA if z.lower() in k.lower() or k.lower() in z.lower()), None)
+                if matched:
+                    if matched not in zone_items:
+                        zone_items[matched] = []
+                    zone_items[matched].append({"name": item["name"], "qty": item.get("total_needed", 1), "icon": item.get("icon")})
+                    assigned = True
+                    break
+            if not assigned:
+                if "Unknown" not in zone_items:
+                    zone_items["Unknown"] = []
+                zone_items["Unknown"].append({"name": item["name"], "qty": item.get("total_needed", 1), "icon": item.get("icon")})
+
+    known_zones = {z: items for z, items in zone_items.items() if z != "Unknown"}
+    unknown_items = zone_items.get("Unknown", [])
+    
+    if not known_zones:
+        return jsonify({
+            "min_cost_route": None,
+            "min_time_route": None,
+            "unknown_items": unknown_items,
+            "message": "No zone data available for any items. Try gathering location lookup first."
+        })
+    
+    min_cost_route = build_route(known_zones, teleport_cost, "Cheapest Route (Min Gil)")
+    min_time_route = build_route(known_zones, travel_time_minutes, "Fastest Route (Min Time)")
+    
+    return jsonify({
+        "min_cost_route": min_cost_route,
+        "min_time_route": min_time_route,
+        "unknown_items": unknown_items,
+        "zone_count": len(known_zones),
+    })
+
+
+@app.route("/api/lookup_zones", methods=["POST"])
+def api_lookup_zones():
+    """
+    Look up gathering zone data for a list of items from XIVAPI.
+    Body: { items: [{item_id, name, icon, total_needed, source}, ...] }
+    Returns items with zones filled in.
+    """
+    body = request.get_json()
+    items = body.get("items", [])
+    results = []
+    
+    for item in items:
+        iid = item.get("item_id")
+        source = item.get("source", "other")
+        zones = []
+        if source == "gathered" and iid:
+            try:
+                locs = get_gathering_locations(iid)
+                zones = [loc["zone"] for loc in locs if loc.get("zone") and loc["zone"] != "Unknown"]
+                zones = list(dict.fromkeys(zones))  # deduplicate
+            except Exception:
+                zones = []
+        results.append({**item, "zones": zones})
+    
+    return jsonify(results)
+
+
 # ---------------------------------------------------------------------------
-# Embedded HTML (no templates/ folder needed)
+# Embedded HTML
 # ---------------------------------------------------------------------------
 
 HTML = r"""<!DOCTYPE html>
@@ -361,7 +845,7 @@ input[type=number]{width:70px}
 button{background:var(--gold-dim);border:1px solid var(--gold);border-radius:var(--r);color:var(--gold2);cursor:pointer;font-family:'Cinzel',serif;font-size:11px;letter-spacing:.08em;padding:8px 14px;transition:background .15s,color .15s;white-space:nowrap}
 button:hover{background:var(--gold);color:var(--bg)}
 button:disabled{opacity:.4;cursor:not-allowed}
-.search-results{padding:0 20px 12px;display:flex;flex-direction:column;gap:4px;max-height:220px;overflow-y:auto}
+.search-results{padding:0 20px 12px;display:flex;flex-direction:column;gap:4px;max-height:200px;overflow-y:auto}
 .sri{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:var(--r);cursor:pointer;border:1px solid transparent;transition:background .1s,border-color .1s}
 .sri:hover{background:var(--bg3);border-color:var(--border)}
 .sri.sel{background:var(--bg3);border-color:var(--gold-dim)}
@@ -369,16 +853,26 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .iico-ph{width:32px;height:32px;border-radius:4px;background:var(--bg3);border:1px solid var(--border);flex-shrink:0}
 .iname{font-size:13px;color:var(--text)}
 .iid{font-size:11px;color:var(--text3)}
-.have-panel{padding:16px 20px;border-bottom:1px solid var(--border);flex:1;overflow-y:auto}
-.have-row{display:flex;align-items:center;gap:8px;margin-bottom:6px;padding:6px 8px;background:var(--bg3);border-radius:var(--r);border:1px solid var(--border)}
-.have-row img{width:24px;height:24px;border-radius:3px}
-.have-name{flex:1;font-size:12px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.have-row input[type=number]{width:60px;padding:4px 8px;font-size:12px;background:var(--bg2)}
+
+/* ---- Needed Item List (formerly "Items I Already Have") ---- */
+.needed-panel{padding:16px 20px;border-bottom:1px solid var(--border);flex:1;overflow-y:auto}
+.needed-panel .panel-label{color:var(--teal);border-bottom:1px solid var(--teal-dim);padding-bottom:6px;margin-bottom:10px}
+.nil-hint{font-size:11px;color:var(--text3);margin-bottom:8px;line-height:1.5}
+.ni-row{display:flex;align-items:center;gap:8px;margin-bottom:6px;padding:6px 8px;background:var(--bg3);border-radius:var(--r);border:1px solid var(--border);position:relative}
+.ni-row.collected{border-color:var(--green-dim);opacity:.5}
+.ni-row img{width:24px;height:24px;border-radius:3px;flex-shrink:0}
+.ni-img-ph{width:24px;height:24px;background:var(--bg);border-radius:3px;flex-shrink:0}
+.ni-name{flex:1;font-size:12px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ni-qty{font-family:'Cinzel',serif;font-size:12px;color:var(--gold2);white-space:nowrap}
+.ni-check{width:18px;height:18px;border:1px solid var(--border2);border-radius:3px;display:flex;align-items:center;justify-content:center;font-size:11px;cursor:pointer;flex-shrink:0;transition:background .15s,border-color .15s;color:var(--green)}
+.ni-row.collected .ni-check{background:var(--green-dim);border-color:var(--green)}
 .rbtn{background:var(--red-dim);border-color:var(--red);color:var(--red);font-size:10px;padding:4px 8px;font-family:'Lato',sans-serif}
 .rbtn:hover{background:var(--red);color:white}
-.action-row{padding:16px 20px;border-top:1px solid var(--border);background:var(--bg2)}
+.action-row{padding:16px 20px;border-top:1px solid var(--border);background:var(--bg2);display:flex;flex-direction:column;gap:8px}
 .btn-primary{width:100%;padding:10px;font-size:12px;letter-spacing:.12em;background:linear-gradient(135deg,#3d2c0a,#6b4c10);border-color:var(--gold);color:var(--gold2)}
 .btn-primary:hover{background:linear-gradient(135deg,var(--gold-dim),#8a6318)}
+.btn-route{width:100%;padding:8px;font-size:11px;letter-spacing:.1em;background:linear-gradient(135deg,var(--teal-dim),#1a6b66);border-color:var(--teal);color:var(--teal)}
+.btn-route:hover{background:var(--teal);color:var(--bg)}
 .empty{text-align:center;color:var(--text3);font-size:12px;padding:16px;font-style:italic}
 .status-bar{font-size:12px;color:var(--text3);display:flex;align-items:center;padding:8px 20px;border-bottom:1px solid var(--border);min-height:36px;background:var(--bg2)}
 .err{color:var(--red)}
@@ -404,8 +898,8 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .b-have{background:#1a2e1a;color:var(--green);border:1px solid #3a6a3a}
 .qty{font-family:'Cinzel',serif;font-size:12px;color:var(--gold2);background:var(--bg3);border:1px solid var(--gold-dim);border-radius:4px;padding:2px 7px;white-space:nowrap;flex-shrink:0}
 .qty.sat{color:var(--text3);border-color:var(--border);background:transparent;text-decoration:line-through}
-.ahb{background:transparent;border:1px solid var(--border);color:var(--text3);font-size:10px;padding:2px 7px;font-family:'Lato',sans-serif;letter-spacing:0}
-.ahb:hover{border-color:var(--gold-dim);color:var(--gold);background:transparent}
+.ahb{background:transparent;border:1px solid var(--teal-dim);color:var(--teal);font-size:10px;padding:2px 7px;font-family:'Lato',sans-serif;letter-spacing:0}
+.ahb:hover{border-color:var(--teal);color:var(--teal);background:var(--teal-dim)}
 .tabs{display:flex;gap:0;margin-bottom:16px;border-bottom:1px solid var(--border)}
 .tab{padding:8px 16px;font-family:'Cinzel',serif;font-size:11px;letter-spacing:.1em;color:var(--text3);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;text-transform:uppercase;transition:color .15s,border-color .15s}
 .tab:hover{color:var(--text2)}
@@ -446,6 +940,52 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .tot-row img{width:22px;height:22px;border-radius:3px}
 .tot-name{flex:1;color:var(--text)}
 .tot-qty{font-family:'Cinzel',serif;font-size:14px;color:var(--gold2)}
+
+/* ---- Route Planner ---- */
+.route-section{background:var(--bg2);border:1px solid var(--teal-dim);border-radius:var(--r);padding:20px}
+.route-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.route-title{font-family:'Cinzel',serif;font-size:13px;letter-spacing:.12em;color:var(--teal);text-transform:uppercase}
+.route-tabs{display:flex;gap:0;margin-bottom:16px;border-bottom:1px solid var(--border)}
+.route-tab{padding:7px 14px;font-family:'Cinzel',serif;font-size:10px;letter-spacing:.1em;color:var(--text3);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;text-transform:uppercase;transition:color .15s,border-color .15s}
+.route-tab.active{color:var(--teal);border-bottom-color:var(--teal)}
+.route-tab:hover{color:var(--text2)}
+.route-tc{display:none}
+.route-tc.active{display:block}
+.route-summary{display:flex;gap:16px;margin-bottom:16px;padding:12px;background:var(--bg3);border-radius:var(--r);border:1px solid var(--border)}
+.route-stat{display:flex;flex-direction:column;align-items:center;flex:1}
+.route-stat-val{font-family:'Cinzel',serif;font-size:20px;color:var(--teal)}
+.route-stat-lbl{font-size:10px;color:var(--text3);letter-spacing:.08em;text-transform:uppercase;margin-top:2px}
+.route-steps{display:flex;flex-direction:column;gap:0}
+.route-step{display:flex;align-items:stretch;gap:0;position:relative}
+.route-step-connector{display:flex;flex-direction:column;align-items:center;width:32px;flex-shrink:0}
+.step-dot{width:12px;height:12px;border-radius:50%;border:2px solid var(--teal);background:var(--bg);flex-shrink:0;margin-top:14px;z-index:1}
+.step-dot.start{background:var(--teal)}
+.step-line{width:2px;background:var(--border2);flex:1;margin:0 auto}
+.route-step:last-child .step-line{display:none}
+.step-card{flex:1;margin:6px 0 6px 8px;padding:12px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);transition:border-color .15s}
+.step-card:hover{border-color:var(--border2)}
+.step-zone{font-family:'Cinzel',serif;font-size:13px;color:var(--text);font-weight:600}
+.step-region{font-size:11px;color:var(--text3);margin-bottom:6px}
+.step-action-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.step-action{font-size:11px;padding:2px 8px;border-radius:3px}
+.step-action.teleport{background:var(--purple-dim);color:var(--purple);border:1px solid var(--purple)}
+.step-action.walk{background:var(--green-dim);color:var(--green);border:1px solid var(--green)}
+.step-action.start{background:var(--teal-dim);color:var(--teal);border:1px solid var(--teal)}
+.step-cost{font-size:11px;color:var(--gold2);font-family:'Cinzel',serif}
+.step-time{font-size:11px;color:var(--blue)}
+.step-items{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid var(--border)}
+.step-item{display:flex;align-items:center;gap:5px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:3px 8px;font-size:11px;color:var(--text2)}
+.step-item img{width:16px;height:16px;border-radius:2px}
+.step-item-qty{color:var(--gold2);font-family:'Cinzel',serif;font-size:11px}
+.route-unknown{margin-top:12px;padding:10px 14px;background:var(--orange-dim);border:1px solid var(--orange);border-radius:var(--r);font-size:12px;color:var(--orange)}
+.route-unknown strong{display:block;margin-bottom:4px;font-family:'Cinzel',serif;letter-spacing:.08em}
+.zone-badge{display:inline-flex;align-items:center;gap:4px;padding:1px 6px;border-radius:3px;font-size:10px;background:var(--bg3);border:1px solid var(--border);color:var(--text3);cursor:pointer;transition:border-color .15s}
+.zone-badge:hover{border-color:var(--teal-dim);color:var(--teal)}
+.zone-edit-row{display:flex;align-items:center;gap:6px;margin-top:6px;flex-wrap:wrap}
+.zone-select{background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:11px;padding:3px 6px;font-family:'Lato',sans-serif;cursor:pointer}
+.route-loading{text-align:center;padding:30px;color:var(--text3)}
+.spin-teal{width:20px;height:20px;border:2px solid var(--border);border-top-color:var(--teal);border-radius:50%;animation:spin .6s linear infinite;display:inline-block;vertical-align:middle;margin-right:8px}
+
 .welcome{display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;padding:60px;text-align:center;gap:12px}
 .welcome h2{font-family:'Cinzel',serif;font-size:22px;color:var(--gold);font-weight:400}
 .welcome p{color:var(--text3);font-size:13px;max-width:340px;line-height:1.8}
@@ -471,103 +1011,161 @@ button:disabled{opacity:.4;cursor:not-allowed}
     </div>
     <div id="stbar" class="status-bar" style="display:none"></div>
     <div id="sr" class="search-results"></div>
-    <div class="have-panel">
-      <div class="panel-label">Items I Already Have</div>
-      <div id="hl"><div class="empty">No items added yet.<br>Click "Have Some?" on tree nodes.</div></div>
+
+    <!-- Needed Item List -->
+    <div class="needed-panel">
+      <div class="panel-label">&#9654; Needed Item List</div>
+      <div class="nil-hint">Items added from breakdown. Check off as you collect them.</div>
+      <div id="nil"><div class="empty">No items tracked yet.<br>Run a breakdown, then click <strong style="color:var(--teal)">&#43; Track</strong> on any material.</div></div>
     </div>
+
     <div class="action-row">
       <button class="btn-primary" id="bb" disabled>&#9658; Calculate Breakdown</button>
+      <button class="btn-route" id="brb" disabled>&#9650; Plan Gathering Route</button>
     </div>
   </aside>
+
   <main class="main" id="ma">
     <div class="welcome" id="ws">
       <h2>Craft Planner</h2>
-      <p>Search for an item, select it, mark what you already have, then calculate the full material breakdown.</p>
-      <div class="hint">Recipe &amp; gathering data via Garland Tools · Locations included</div>
+      <p>Search for an item, select it, then calculate the full material breakdown. Track what you need, then plan an efficient gathering route.</p>
+      <div class="hint">Recipe &amp; gathering data via XIVAPI · TSP route optimization included</div>
     </div>
   </main>
 </div>
+
 <script>
-const S={sel:null,have:{},loaded:false};
-const $=id=>document.getElementById(id);
-const stbar=$('stbar');
+// ---- State ----
+const S = {
+  sel: null,
+  neededItems: {}, // id -> {id, name, icon, qty_needed, source, collected, zones}
+  loaded: false,
+  lastGrouped: null,
+  lastRaw: null,
+};
 
-function setStatus(msg,err){
-  if(!msg){stbar.style.display='none';return}
-  stbar.style.display='flex';
-  stbar.innerHTML=err?`<span class="err">${msg}</span>`:`<span class="spin"></span>${msg}`;
+const $ = id => document.getElementById(id);
+const stbar = $('stbar');
+
+function setStatus(msg, err) {
+  if (!msg) { stbar.style.display = 'none'; return; }
+  stbar.style.display = 'flex';
+  stbar.innerHTML = err
+    ? `<span class="err">${msg}</span>`
+    : `<span class="spin"></span>${msg}`;
 }
 
-$('sb').onclick=$('si').onkeydown=function(e){if(e.type==='click'||e.key==='Enter')doSearch()};
+// ---- Search ----
+$('sb').onclick = $('si').onkeydown = function(e) {
+  if (e.type === 'click' || e.key === 'Enter') doSearch();
+};
 
-async function doSearch(){
-  const q=$('si').value.trim();if(!q)return;
+async function doSearch() {
+  const q = $('si').value.trim();
+  if (!q) return;
   setStatus('Searching...');
-  try{
-    const r=await fetch('/api/search?q='+encodeURIComponent(q));
-    const d=await r.json();
+  try {
+    const r = await fetch('/api/search?q=' + encodeURIComponent(q));
+    const d = await r.json();
     setStatus('');
-    renderResults(Array.isArray(d)?d:[]);
-  }catch(e){setStatus('Search failed — is the server running?',true)}
+    renderResults(Array.isArray(d) ? d : []);
+  } catch(e) { setStatus('Search failed — is the server running?', true); }
 }
 
-function renderResults(items){
-  const el=$('sr');el.innerHTML='';
-  if(!items.length){el.innerHTML='<div class="empty">No results found.</div>';return}
-  items.forEach(item=>{
-    const row=document.createElement('div');
-    row.className='sri';
-    row.innerHTML=`${item.icon?`<img class="iico" src="${item.icon}" alt="">`:'<div class="iico-ph"></div>'}
+function renderResults(items) {
+  const el = $('sr'); el.innerHTML = '';
+  if (!items.length) { el.innerHTML = '<div class="empty">No results found.</div>'; return; }
+  items.forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'sri';
+    row.innerHTML = `${item.icon ? `<img class="iico" src="${item.icon}" alt="">` : '<div class="iico-ph"></div>'}
       <div><div class="iname">${item.name}</div><div class="iid">ID: ${item.id}</div></div>`;
-    row.onclick=()=>{
-      document.querySelectorAll('.sri').forEach(r=>r.classList.remove('sel'));
-      row.classList.add('sel');S.sel=item;$('bb').disabled=false;
+    row.onclick = () => {
+      document.querySelectorAll('.sri').forEach(r => r.classList.remove('sel'));
+      row.classList.add('sel');
+      S.sel = item;
+      $('bb').disabled = false;
     };
     el.appendChild(row);
   });
 }
 
-function addHave(item){
-  if(S.have[item.id])return;
-  S.have[item.id]={...item,qty:0};renderHave();
+// ---- Needed Item List ----
+function addNeededItem(item) {
+  const key = String(item.id);
+  if (S.neededItems[key]) return; // already tracked
+  S.neededItems[key] = {
+    id: item.id,
+    name: item.name,
+    icon: item.icon || null,
+    qty_needed: item.qty_needed || 1,
+    source: item.source || 'other',
+    collected: false,
+    zones: [],
+  };
+  renderNeededList();
+  $('brb').disabled = Object.keys(S.neededItems).length === 0;
 }
 
-function renderHave(){
-  const el=$('hl');
-  const items=Object.values(S.have);
-  if(!items.length){el.innerHTML='<div class="empty">No items added yet.<br>Click "Have Some?" on tree nodes.</div>';return}
-  el.innerHTML='';
-  items.forEach(item=>{
-    const row=document.createElement('div');row.className='have-row';
-    row.innerHTML=`${item.icon?`<img src="${item.icon}" alt="">`:'<div style="width:24px;height:24px;background:var(--bg3);border-radius:3px"></div>'}
-      <span class="have-name">${item.name}</span>
-      <input type="number" min="0" value="${item.qty}" data-id="${item.id}" class="hqi">
-      <button class="rbtn" data-id="${item.id}">✕</button>`;
+function renderNeededList() {
+  const el = $('nil');
+  const items = Object.values(S.neededItems);
+  if (!items.length) {
+    el.innerHTML = '<div class="empty">No items tracked yet.<br>Run a breakdown, then click <strong style="color:var(--teal)">&#43; Track</strong> on any material.</div>';
+    $('brb').disabled = true;
+    return;
+  }
+  el.innerHTML = '';
+  items.forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'ni-row' + (item.collected ? ' collected' : '');
+    row.innerHTML = `
+      <div class="ni-check" data-id="${item.id}">${item.collected ? '✓' : ''}</div>
+      ${item.icon ? `<img src="${item.icon}" alt="">` : '<div class="ni-img-ph"></div>'}
+      <span class="ni-name">${item.name}</span>
+      <span class="ni-qty">×${item.qty_needed}</span>
+      <button class="rbtn" data-id="${item.id}" title="Remove">✕</button>`;
+    row.querySelector('.ni-check').onclick = e => {
+      const id = e.currentTarget.dataset.id;
+      S.neededItems[id].collected = !S.neededItems[id].collected;
+      renderNeededList();
+    };
+    row.querySelector('.rbtn').onclick = e => {
+      delete S.neededItems[e.currentTarget.dataset.id];
+      renderNeededList();
+      $('brb').disabled = Object.keys(S.neededItems).length === 0;
+    };
     el.appendChild(row);
   });
-  el.querySelectorAll('.hqi').forEach(i=>i.onchange=e=>{S.have[e.target.dataset.id].qty=parseInt(e.target.value)||0});
-  el.querySelectorAll('.rbtn').forEach(b=>b.onclick=e=>{delete S.have[e.target.dataset.id];renderHave()});
+  $('brb').disabled = false;
 }
 
-$('bb').onclick=async function(){
-  if(!S.sel)return;
-  const qty=parseInt($('qi').value)||1;
-  setStatus('Fetching recipe tree...');$('bb').disabled=true;
-  const hm={};Object.values(S.have).forEach(it=>{hm[it.id]=it.qty});
-  try{
-    const r=await fetch('/api/breakdown',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({item_id:S.sel.id,quantity:qty,have_items:hm})});
-    const d=await r.json();
-    setStatus('');renderBreakdown(d,S.sel.name,qty);
-  }catch(e){setStatus('Breakdown failed.',true)}
-  $('bb').disabled=false;
+// ---- Breakdown ----
+$('bb').onclick = async function() {
+  if (!S.sel) return;
+  const qty = parseInt($('qi').value) || 1;
+  setStatus('Fetching recipe tree...');
+  $('bb').disabled = true;
+  try {
+    const r = await fetch('/api/breakdown', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({item_id: S.sel.id, quantity: qty, have_items: {}})
+    });
+    const d = await r.json();
+    S.lastGrouped = d.grouped_materials;
+    S.lastRaw = d.raw_materials;
+    setStatus('');
+    renderBreakdown(d, S.sel.name, qty);
+  } catch(e) { setStatus('Breakdown failed.', true); }
+  $('bb').disabled = false;
 };
 
-function renderBreakdown(data,name,qty){
-  const ma=$('ma');
-  if($('ws'))$('ws').style.display='none';
-  if(!window._ck)window._ck={};
-  ma.innerHTML=`
+function renderBreakdown(data, name, qty) {
+  const ma = $('ma');
+  if ($('ws')) $('ws').style.display = 'none';
+  if (!window._ck) window._ck = {};
+  ma.innerHTML = `
     <div>
       <div class="sec-title">Recipe Tree — ${name} ×${qty}</div>
       <div class="tree-card" id="tc"></div>
@@ -580,118 +1178,268 @@ function renderBreakdown(data,name,qty){
       </div>
       <div class="tc active" id="tab-cl"></div>
       <div class="tc" id="tab-tot"></div>
-    </div>`;
-  ma.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
-    ma.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
-    ma.querySelectorAll('.tc').forEach(x=>x.classList.remove('active'));
+    </div>
+    <div id="route-section-container"></div>`;
+
+  ma.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+    ma.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    ma.querySelectorAll('.tc').forEach(x => x.classList.remove('active'));
     t.classList.add('active');
-    ma.querySelector('#tab-'+t.dataset.tab).classList.add('active');
+    ma.querySelector('#tab-' + t.dataset.tab).classList.add('active');
   });
-  renderTree(data.tree,$('tc'),0);
-  renderChecklist(data.grouped_materials,$('tab-cl'));
-  renderTotals(data.raw_materials,$('tab-tot'));
+
+  renderTree(data.tree, $('tc'), 0);
+  renderChecklist(data.grouped_materials, $('tab-cl'));
+  renderTotals(data.raw_materials, $('tab-tot'));
 }
 
-function renderTree(node,container,depth){
-  const wrap=document.createElement('div');
-  const rw=document.createElement('div');rw.style.cssText='display:flex;align-items:stretch';
-  for(let i=0;i<depth;i++){const l=document.createElement('div');l.className='tline';rw.appendChild(l)}
-  const row=document.createElement('div');row.className='tnr';row.style.flex='1';
-  const sat=node.qty_to_craft_or_gather===0;
-  const sb=sat?'<span class="badge b-have">✓ Have</span>':`<span class="badge b-${node.source}">${node.source}</span>`;
-  const cm=node.job?`<span>Lv${node.level} ${jobName(node.job)}</span><span>×${node.times_to_craft} craft${node.times_to_craft>1?'s':''}</span>`:'';
-  row.innerHTML=`${node.icon?`<img class="nico" src="${node.icon}" alt="">`:'<div class="nico-ph"></div>'}
-    <div class="ninfo"><div class="nname">${node.name}</div><div class="nmeta">${sb}${cm?'&nbsp;'+cm:''}</div></div>
+function renderTree(node, container, depth) {
+  const wrap = document.createElement('div');
+  const rw = document.createElement('div'); rw.style.cssText = 'display:flex;align-items:stretch';
+  for (let i = 0; i < depth; i++) { const l = document.createElement('div'); l.className = 'tline'; rw.appendChild(l); }
+  const row = document.createElement('div'); row.className = 'tnr'; row.style.flex = '1';
+  const sat = node.qty_to_craft_or_gather === 0;
+  const sb2 = sat ? '<span class="badge b-have">✓ Have</span>' : `<span class="badge b-${node.source}">${node.source}</span>`;
+  const cm = node.job ? `<span>Lv${node.level} ${node.job}</span><span>×${node.times_to_craft} craft${node.times_to_craft > 1 ? 's' : ''}</span>` : '';
+  const isLeafItem = !sat && node.is_leaf;
+  row.innerHTML = `${node.icon ? `<img class="nico" src="${node.icon}" alt="">` : '<div class="nico-ph"></div>'}
+    <div class="ninfo"><div class="nname">${node.name}</div><div class="nmeta">${sb2}${cm ? '&nbsp;' + cm : ''}</div></div>
     <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
-      <span class="qty${sat?' sat':''}">&times;${node.qty_needed}${node.qty_have>0?` (have ${node.qty_have})`:''}</span>
-      ${(!sat&&node.is_leaf)?`<button class="ahb" data-id="${node.item_id}" data-name="${node.name}" data-icon="${node.icon||''}">Have Some?</button>`:''}
+      <span class="qty${sat ? ' sat' : ''}">×${node.qty_needed}</span>
+      ${isLeafItem ? `<button class="ahb" data-id="${node.item_id}" data-name="${node.name}" data-icon="${node.icon||''}" data-qty="${node.qty_to_craft_or_gather}" data-src="${node.source}">+ Track</button>` : ''}
     </div>`;
-  rw.appendChild(row);wrap.appendChild(rw);
-  if(node.children&&node.children.length){
-    const cc=document.createElement('div');
-    node.children.forEach(c=>renderTree(c,cc,depth+1));
+  rw.appendChild(row); wrap.appendChild(rw);
+  if (node.children && node.children.length) {
+    const cc = document.createElement('div');
+    node.children.forEach(c => renderTree(c, cc, depth + 1));
     wrap.appendChild(cc);
   }
   container.appendChild(wrap);
-  row.querySelectorAll('.ahb').forEach(b=>b.onclick=()=>addHave({id:b.dataset.id,name:b.dataset.name,icon:b.dataset.icon||null,qty:0}));
+  row.querySelectorAll('.ahb').forEach(b => b.onclick = () => {
+    addNeededItem({
+      id: b.dataset.id,
+      name: b.dataset.name,
+      icon: b.dataset.icon || null,
+      qty_needed: parseInt(b.dataset.qty) || 1,
+      source: b.dataset.src || 'other',
+    });
+    b.textContent = '✓ Tracked';
+    b.disabled = true;
+  });
 }
 
-const JOBS={8:'CRP',9:'BSM',10:'ARM',11:'GSM',12:'LTW',13:'WVR',14:'ALC',15:'CUL'};
-function jobName(id){return JOBS[id]||`Job ${id}`}
-
-function renderChecklist(grouped,container){
-  const order=['gathered','crystal','mob','vendor','other'];
-  const labels={gathered:'Gathered',crystal:'Crystals & Shards',mob:'Mob Drops',vendor:'Vendor / Trade',other:'Other'};
-  container.innerHTML='';let any=false;
-  order.forEach(src=>{
-    const items=grouped[src]||[];if(!items.length)return;any=true;
-    const sec=document.createElement('div');sec.className='gs';
-    sec.innerHTML=`<div class="gsh"><span class="gsl ${src}">${labels[src]}</span><div class="gsline"></div><span class="gsc">${items.length} item${items.length>1?'s':''}</span></div><div class="checklist"></div>`;
-    const list=sec.querySelector('.checklist');
-    items.forEach(mat=>{
-      const card=document.createElement('div');card.className='ci';
-      if(window._ck[mat.item_id])card.classList.add('done');
-      const hasLoc=(mat.gather_sources&&mat.gather_sources.length)||mat.has_mob_drop;
-      card.innerHTML=`
+function renderChecklist(grouped, container) {
+  const order = ['gathered','crystal','mob','vendor','other'];
+  const labels = {gathered:'Gathered',crystal:'Crystals & Shards',mob:'Mob Drops',vendor:'Vendor / Trade',other:'Other'};
+  container.innerHTML = ''; let any = false;
+  order.forEach(src => {
+    const items = grouped[src] || []; if (!items.length) return; any = true;
+    const sec = document.createElement('div'); sec.className = 'gs';
+    sec.innerHTML = `<div class="gsh"><span class="gsl ${src}">${labels[src]}</span><div class="gsline"></div><span class="gsc">${items.length} item${items.length>1?'s':''}</span></div><div class="checklist"></div>`;
+    const list = sec.querySelector('.checklist');
+    items.forEach(mat => {
+      const card = document.createElement('div'); card.className = 'ci';
+      if (window._ck[mat.item_id]) card.classList.add('done');
+      card.innerHTML = `
         <div class="cimain">
-          <div class="cbox">${window._ck[mat.item_id]?'✓':''}</div>
-          ${mat.icon?`<img class="cico" src="${mat.icon}" alt="">`:'<div class="cico-ph"></div>'}
-          <div class="ciinfo"><div class="ciname">${mat.name}</div><div class="ciqty">&times;${mat.total_needed}</div></div>
-          ${hasLoc?'<button class="expand-btn">&#9662; Where</button>':''}
-        </div>
-        ${hasLoc?`<div class="cilocs">${buildLocs(mat,src)}</div>`:''}`;
-      card.querySelector('.cimain').onclick=e=>{
-        if(e.target.classList.contains('expand-btn')){
-          card.classList.toggle('exp');
-          e.target.innerHTML=card.classList.contains('exp')?'&#9652; Where':'&#9662; Where';
-          return;
-        }
+          <div class="cbox">${window._ck[mat.item_id] ? '✓' : ''}</div>
+          ${mat.icon ? `<img class="cico" src="${mat.icon}" alt="">` : '<div class="cico-ph"></div>'}
+          <div class="ciinfo"><div class="ciname">${mat.name}</div><div class="ciqty">×${mat.total_needed}</div></div>
+        </div>`;
+      card.querySelector('.cimain').onclick = () => {
         card.classList.toggle('done');
-        const box=card.querySelector('.cbox');
-        window._ck[mat.item_id]=card.classList.contains('done');
-        box.textContent=window._ck[mat.item_id]?'✓':'';
+        const box = card.querySelector('.cbox');
+        window._ck[mat.item_id] = card.classList.contains('done');
+        box.textContent = window._ck[mat.item_id] ? '✓' : '';
       };
       list.appendChild(card);
     });
     container.appendChild(sec);
   });
-  if(!any)container.innerHTML='<div class="empty">No raw materials needed — you already have everything!</div>';
+  if (!any) container.innerHTML = '<div class="empty">No raw materials needed.</div>';
 }
 
-function buildLocs(mat,src){
-  const rows=[];
-  if(mat.gather_sources&&mat.gather_sources.length){
-    mat.gather_sources.forEach(gs=>{
-      const zone=gs.zone||gs.area||'Unknown zone';
-      const coords=gs.coords?`<span class="lcoords">${gs.coords}</span>`:'';
-      rows.push(`<div class="lrow"><span class="ltype">${gs.type||'Gathering'} Lv${gs.level}</span><span class="ldetail">${zone} ${coords}</span></div>`);
-    });
-  }
-  if(mat.has_mob_drop)rows.push(`<div class="lrow"><span class="ltype mob">Mob Drop</span><span class="ldetail">Search the enemy list in-game or check Garland Tools for spawn locations.</span></div>`);
-  if(src==='vendor')rows.push(`<div class="lrow"><span class="ltype vendor">Vendor</span><span class="ldetail">Available from shop NPCs — check Garland Tools for exact vendor locations.</span></div>`);
-  return rows.length?rows.join(''):'<div class="noloc">No location data available.</div>';
-}
-
-function renderTotals(raw,container){
-  container.innerHTML='';
-  const items=Object.values(raw).sort((a,b)=>a.name.localeCompare(b.name));
-  if(!items.length){container.innerHTML='<div class="empty">No raw materials needed.</div>';return}
-  const card=document.createElement('div');card.className='tot-card';
-  items.forEach(mat=>{
-    const src=mat.source||'other';
-    const row=document.createElement('div');row.className='tot-row';
-    row.innerHTML=`${mat.icon?`<img src="${mat.icon}" alt="">`:'<div style="width:22px;height:22px;background:var(--bg3);border-radius:3px"></div>'}
+function renderTotals(raw, container) {
+  container.innerHTML = '';
+  const items = Object.values(raw).sort((a,b) => a.name.localeCompare(b.name));
+  if (!items.length) { container.innerHTML = '<div class="empty">No raw materials needed.</div>'; return; }
+  const card = document.createElement('div'); card.className = 'tot-card';
+  items.forEach(mat => {
+    const src = mat.source || 'other';
+    const row = document.createElement('div'); row.className = 'tot-row';
+    row.innerHTML = `${mat.icon ? `<img src="${mat.icon}" alt="">` : '<div style="width:22px;height:22px;background:var(--bg3);border-radius:3px"></div>'}
       <span class="tot-name">${mat.name}</span>
       <span class="badge b-${src}" style="margin-right:6px">${src}</span>
-      <span class="tot-qty">&times;${mat.total_needed}</span>`;
+      <span class="tot-qty">×${mat.total_needed}</span>`;
     card.appendChild(row);
   });
   container.appendChild(card);
 }
+
+// ---- Route Planner ----
+$('brb').onclick = async function() {
+  if (!Object.keys(S.neededItems).length) return;
+
+  // Find or create route section
+  let rsc = $('route-section-container');
+  if (!rsc) {
+    // If breakdown hasn't been run, inject at end of main
+    const ma = $('ma');
+    if ($('ws')) $('ws').style.display = 'none';
+    const div = document.createElement('div');
+    div.id = 'route-section-container';
+    ma.appendChild(div);
+    rsc = div;
+  }
+
+  rsc.innerHTML = `
+    <div class="route-section">
+      <div class="route-header">
+        <div class="route-title">&#9650; Gathering Route Planner</div>
+      </div>
+      <div class="route-loading"><span class="spin-teal"></span>Looking up gathering zones…</div>
+    </div>`;
+  rsc.scrollIntoView({behavior:'smooth'});
+
+  try {
+    // Step 1: look up zones for gathered items
+    const itemsToLookup = Object.values(S.neededItems).map(it => ({
+      item_id: it.id,
+      name: it.name,
+      icon: it.icon,
+      total_needed: it.qty_needed,
+      source: it.source,
+    }));
+
+    const lookupR = await fetch('/api/lookup_zones', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({items: itemsToLookup})
+    });
+    const itemsWithZones = await lookupR.json();
+
+    // Update neededItems with zone data
+    itemsWithZones.forEach(it => {
+      if (S.neededItems[String(it.item_id)]) {
+        S.neededItems[String(it.item_id)].zones = it.zones || [];
+      }
+    });
+
+    // Step 2: ask for routes (only gathered/crystal items with zones, 
+    // plus "other" items as unknown)
+    const routeItems = itemsWithZones.filter(it => 
+      it.source === 'gathered' || it.source === 'crystal' || it.source === 'other'
+    );
+
+    const routeR = await fetch('/api/route', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({items: routeItems})
+    });
+    const routeData = await routeR.json();
+
+    renderRouteSection(rsc, routeData, itemsWithZones);
+  } catch(e) {
+    rsc.innerHTML = `<div class="route-section"><div class="err" style="padding:16px">Route planning failed: ${e.message}</div></div>`;
+  }
+};
+
+function renderRouteSection(container, data, allItems) {
+  const minC = data.min_cost_route;
+  const minT = data.min_time_route;
+  const unknown = data.unknown_items || [];
+
+  let html = `<div class="route-section">
+    <div class="route-header">
+      <div class="route-title">&#9650; Gathering Route — ${data.zone_count || 0} Zone${(data.zone_count||0)!==1?'s':''}</div>
+    </div>`;
+
+  if (!minC && !minT) {
+    html += `<div style="color:var(--text3);font-size:13px;padding:8px">${data.message || 'No route data available.'}</div>`;
+  } else {
+    html += `<div class="route-tabs">
+      <div class="route-tab active" data-rtab="cost">&#9830; Min Cost</div>
+      <div class="route-tab" data-rtab="time">&#9672; Min Time</div>
+    </div>
+    <div class="route-tc active" id="rtab-cost">${renderRoute(minC)}</div>
+    <div class="route-tc" id="rtab-time">${renderRoute(minT)}</div>`;
+  }
+
+  if (unknown.length) {
+    html += `<div class="route-unknown"><strong>&#9888; Items Without Zone Data</strong>
+      These items couldn't be matched to a known zone — check Garland Tools for locations:<br>
+      ${unknown.map(u => `<span style="color:var(--text2)">${u.name} ×${u.qty}</span>`).join(' · ')}
+    </div>`;
+  }
+
+  html += '</div>';
+  container.innerHTML = html;
+
+  // Tab switching
+  container.querySelectorAll('.route-tab').forEach(t => t.onclick = () => {
+    container.querySelectorAll('.route-tab').forEach(x => x.classList.remove('active'));
+    container.querySelectorAll('.route-tc').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    container.querySelector('#rtab-' + t.dataset.rtab).classList.add('active');
+  });
+}
+
+function renderRoute(route) {
+  if (!route) return '<div class="empty">No route available.</div>';
+  const steps = route.steps || [];
+
+  let html = `<div class="route-summary">
+    <div class="route-stat">
+      <div class="route-stat-val">${route.total_cost.toLocaleString()}</div>
+      <div class="route-stat-lbl">Gil (Teleport)</div>
+    </div>
+    <div class="route-stat">
+      <div class="route-stat-val">~${route.total_time_min}</div>
+      <div class="route-stat-lbl">Minutes</div>
+    </div>
+    <div class="route-stat">
+      <div class="route-stat-val">${steps.length}</div>
+      <div class="route-stat-lbl">Zones</div>
+    </div>
+  </div>
+  <div class="route-steps">`;
+
+  steps.forEach((step, i) => {
+    const isStart = i === 0;
+    const actionClass = isStart ? 'start' : (step.teleport_cost > 0 ? 'teleport' : 'walk');
+    const actionLabel = isStart ? 'Start Here' : (step.teleport_cost > 0 ? `Teleport · ${step.teleport_cost.toLocaleString()} gil` : 'Walk / Chocobo');
+    const timeLabel = step.travel_time > 0 ? `~${step.travel_time} min travel` : '';
+
+    html += `<div class="route-step">
+      <div class="route-step-connector">
+        <div class="step-dot${isStart?' start':''}"></div>
+        <div class="step-line"></div>
+      </div>
+      <div class="step-card">
+        <div class="step-zone">${step.zone}</div>
+        <div class="step-region">${step.region} · ${step.expansion}</div>
+        <div class="step-action-row">
+          <span class="step-action ${actionClass}">${actionLabel}</span>
+          ${timeLabel ? `<span class="step-time">${timeLabel}</span>` : ''}
+        </div>
+        <div class="step-items">
+          ${(step.items||[]).map(it => `
+            <div class="step-item">
+              ${it.icon ? `<img src="${it.icon}" alt="">` : ''}
+              ${it.name}
+              <span class="step-item-qty">×${it.qty}</span>
+            </div>`).join('')}
+        </div>
+      </div>
+    </div>`;
+  });
+
+  html += '</div>';
+  return html;
+}
 </script>
 </body>
 </html>"""
-
 
 if __name__ == "__main__":
     app.run(debug=False, port=5000)
