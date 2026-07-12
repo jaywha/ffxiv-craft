@@ -1,0 +1,143 @@
+import pytest
+
+import app as app_module
+
+
+@pytest.fixture
+def client():
+    app_module.app.config["TESTING"] = True
+    with app_module.app.test_client() as c:
+        yield c
+
+
+@pytest.fixture
+def no_network(monkeypatch):
+    """Replace xiv_get with a stub that fails loudly on any unmocked call."""
+
+    def _boom(path, params=None, timeout=10):
+        raise AssertionError(f"Unmocked xiv_get call: path={path!r} params={params!r}")
+
+    monkeypatch.setattr(app_module, "xiv_get", _boom)
+    return monkeypatch
+
+
+def _icon(path="icon/1.png"):
+    return {"path_hr1": path, "path": path}
+
+
+@pytest.fixture
+def iron_ingot_chain(monkeypatch):
+    """Mocked XIVAPI responses for a small craft tree:
+
+    Iron Ingot (100, crafted, 1 per craft)
+      <- Iron Ore (101, gathered) x2
+      <- Fire Shard (102, crystal) x1
+
+    Iron Ore has one known gathering location, found via the
+    GatheringPoint array-bracket search (the "happy path" in
+    get_gathering_locations).
+    """
+
+    def fake_xiv_get(path, params=None, timeout=10):
+        params = params or {}
+
+        if path == "/search":
+            sheets = params.get("sheets")
+            query = params.get("query", "")
+
+            if sheets == "Recipe":
+                if query == "+ItemResult=100":
+                    return {"results": [{"row_id": 1}]}
+                return {"results": []}
+
+            if sheets == "GatheringItem":
+                if query == "+Item=101":
+                    return {
+                        "results": [
+                            {
+                                "row_id": 501,
+                                "fields": {
+                                    "GatheringItemLevel": {"fields": {"GatheringItemLevel": 5}}
+                                },
+                            }
+                        ]
+                    }
+                return {"results": []}
+
+            if sheets == "GatheringPoint":
+                if query == "+Item[]=501":
+                    return {
+                        "results": [
+                            {
+                                "fields": {
+                                    "PlaceName": {"fields": {"Name": "Western Thanalan"}},
+                                    "TerritoryType": {"fields": {"Name": "Western Thanalan"}},
+                                    "GatheringPointBase": {
+                                        "fields": {"GatheringType": {"fields": {"Name": "Mining"}}}
+                                    },
+                                }
+                            }
+                        ]
+                    }
+                return {"results": []}
+
+            raise AssertionError(f"Unexpected /search call: {params}")
+
+        if path == "/sheet/Recipe/1":
+            return {
+                "fields": {
+                    "ItemResult": {"fields": {"Name": "Iron Ingot"}},
+                    "AmountResult": 1,
+                    "CraftType": {"fields": {"Name": "Blacksmith"}},
+                    "RecipeLevelTable": {"fields": {"ClassJobLevel": 10}},
+                    "Ingredient": [
+                        {
+                            "value": 101,
+                            "fields": {
+                                "Name": "Iron Ore",
+                                "Icon": _icon(),
+                                "ItemUICategory": {"fields": {"Name": "Ore"}},
+                            },
+                        },
+                        {
+                            "value": 102,
+                            "fields": {
+                                "Name": "Fire Shard",
+                                "Icon": _icon(),
+                                "ItemUICategory": {"fields": {"Name": "Crystal"}},
+                            },
+                        },
+                    ],
+                    "AmountIngredient": [2, 1],
+                }
+            }
+
+        if path == "/sheet/Item/100":
+            return {
+                "fields": {
+                    "Name": "Iron Ingot",
+                    "Icon": _icon(),
+                    "ItemUICategory": {"fields": {"Name": "Metal"}},
+                }
+            }
+        if path == "/sheet/Item/101":
+            return {
+                "fields": {
+                    "Name": "Iron Ore",
+                    "Icon": _icon(),
+                    "ItemUICategory": {"fields": {"Name": "Ore"}},
+                }
+            }
+        if path == "/sheet/Item/102":
+            return {
+                "fields": {
+                    "Name": "Fire Shard",
+                    "Icon": _icon(),
+                    "ItemUICategory": {"fields": {"Name": "Crystal"}},
+                }
+            }
+
+        raise AssertionError(f"Unexpected xiv_get call: path={path!r} params={params!r}")
+
+    monkeypatch.setattr(app_module, "xiv_get", fake_xiv_get)
+    return fake_xiv_get
