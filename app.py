@@ -371,26 +371,38 @@ def teleport_cost(z1, z2):
     d2 = ZONE_DATA.get(z2, {})
     return d2.get("teleport_cost", 300)
 
+def _route_cost(path, cost_fn):
+    """Total cost of a path under cost_fn, with the first stop free (you start
+    there). Mirrors how build_route tallies per-step cost."""
+    return sum(cost_fn(path[i - 1], path[i]) for i in range(1, len(path)))
+
+
 def solve_tsp_nearest_neighbor(zones, cost_fn):
-    """Greedy nearest-neighbor TSP. Returns ordered list of zones."""
-    if not zones:
-        return []
-    if len(zones) == 1:
-        return list(zones)
-    
-    remaining = list(zones)
-    # Start from cheapest-to-reach zone
-    start = min(remaining, key=lambda z: ZONE_DATA.get(z, {}).get("teleport_cost", 999))
-    path = [start]
-    remaining.remove(start)
-    
-    while remaining:
-        current = path[-1]
-        next_z = min(remaining, key=lambda z: cost_fn(current, z))
-        path.append(next_z)
-        remaining.remove(next_z)
-    
-    return path
+    """Repeated greedy nearest-neighbor TSP: run NN from every possible start
+    and keep the cheapest complete route under cost_fn.
+
+    Trying all starts matters because the first stop is free. For the min-gil
+    objective (teleport cost depends only on the destination) the optimum is to
+    make the most expensive zone the free start -- a single fixed start would
+    instead leave that pricey teleport in the tally. Routes have only a handful
+    of zones, so O(n^3) here is negligible."""
+    zlist = list(zones)
+    if len(zlist) <= 1:
+        return zlist
+
+    best_path, best_cost = None, None
+    for start in zlist:
+        remaining = [z for z in zlist if z != start]
+        path = [start]
+        while remaining:
+            current = path[-1]
+            nxt = min(remaining, key=lambda z: cost_fn(current, z))
+            path.append(nxt)
+            remaining.remove(nxt)
+        cost = _route_cost(path, cost_fn)
+        if best_cost is None or cost < best_cost:
+            best_path, best_cost = path, cost
+    return best_path
 
 def build_route(zones, cost_fn, label):
     """Build route with step-by-step instructions."""

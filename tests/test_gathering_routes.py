@@ -98,12 +98,23 @@ def test_tsp_visits_every_zone_exactly_once():
     assert len(path) == len(zones)
 
 
-def test_tsp_starts_from_cheapest_to_reach_zone():
-    # Limsa Lominsa is a city with teleport_cost 0, so it should be the start
-    # regardless of input order.
+def test_tsp_min_cost_starts_at_most_expensive_zone():
+    # Teleport cost is destination-only and the first stop is free, so the
+    # cheapest route makes the priciest zone the free start. Western La Noscea
+    # (260) is dearer than Eastern (220) and Limsa (0), so it should lead.
     zones = ["Western La Noscea", "Limsa Lominsa", "Eastern La Noscea"]
     path = solve_tsp_nearest_neighbor(zones, teleport_cost)
-    assert path[0] == "Limsa Lominsa"
+    assert path[0] == "Western La Noscea"
+
+
+def test_tsp_min_cost_is_optimal_over_all_starts():
+    # Cost = sum of every zone's teleport cost minus the (free) start; the
+    # solver must find the global minimum, not just a fixed-start greedy result.
+    zones = ["Eastern La Noscea", "Northern Thanalan", "Coerthas Central Highlands"]
+    route = build_route({z: [] for z in zones}, teleport_cost, "min cost")
+    total = sum(ZONE_DATA[z]["teleport_cost"] for z in zones)
+    best = total - max(ZONE_DATA[z]["teleport_cost"] for z in zones)
+    assert route["total_cost"] == best  # 480, not the fixed-start 660
 
 
 # ---------------------------------------------------------------------------
