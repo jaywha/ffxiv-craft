@@ -133,43 +133,45 @@ def classify(name, ui_category, has_recipe):
 # Gathering location lookup via XIVAPI GatheringPoint sheet
 # ---------------------------------------------------------------------------
 
+def _extract_exported_point(base_id):
+    """Fetch raw node coords/radius from ExportedGatheringPoint, keyed by the
+    GatheringPointBase row id. Returns {x, y, radius} or {} if unavailable.
+
+    NOTE: X/Y here are raw world coordinates, not the in-game map coordinates
+    shown to players. Conversion to map coords requires the zone's Map
+    SizeFactor and is applied downstream."""
+    try:
+        data = xiv_get(f"/sheet/ExportedGatheringPoint/{base_id}")
+        f = data.get("fields", {})
+        return {"x": f.get("X"), "y": f.get("Y"), "radius": f.get("Radius")}
+    except Exception:
+        return {}
+
+
 def get_gathering_locations(item_id):
-    """Return list of {zone, x, y, type, level} for a gathered item.
+    """Return list of gathering nodes for a gathered item, each shaped:
+        {zone, pinpoint, type, level, x, y, radius}
 
-    XIVAPI v2 has NO reverse-lookup (GameContentLinks was v1 only), so we
-    can only traverse relationships forward.  The chain that works is:
+    XIVAPI v2 has NO reverse-lookup, so we traverse relationships forward:
 
-      1. Search GatheringItem where +Item={item_id}
-            -> gives us gi_id and GatheringItemLevel
+      1. GatheringItem  +Item={item_id}
+            -> gi_id (GatheringItem row) + node level.
 
-      2. Fetch the GatheringItem row directly by gi_id with expanded fields:
-            GatheringItemLevel.GatheringItemLevel   (numeric level)
+      2. GatheringPoint +GatheringPointBase.Item[]={gi_id}
+            -> zone     = TerritoryType.PlaceName.Name  (the actual map, e.g.
+                          "Western Thanalan" -- this is what ZONE_DATA keys on)
+               pinpoint = PlaceName.Name                (landmark, e.g.
+                          "Horizon's Edge")
+               job      = GatheringPointBase.GatheringType.Name
+               base_id  = GatheringPointBase row id     (keys step 3)
 
-         GatheringItem itself does NOT link to a zone.  Zone comes from
-         GatheringPoint, which we can search by +PlaceName= ... but we don't
-         know the zone yet, so that's circular.
+      3. ExportedGatheringPoint/{base_id}
+            -> raw X/Y/Radius for the node.
 
-         Instead we use GatheringPoint searched by its *searchable* scalar
-         field GatheringPointBase -- but that also requires knowing gpb_id.
-
-      Workaround: search GatheringPoint directly with a combined query that
-      matches based on the gathering job category inferred from the item's
-      ItemUICategory (Miner vs Botanist) and the level range, then validate
-      by fetching each point's item list.  Too expensive.
-
-      Practical solution for v2: search GatheringPoint with
-          +GatheringPointBase.GatheringType=N  (job filter)
-      is not supported either.
-
-      BEST AVAILABLE APPROACH for v2:
-      Search GatheringPoint where PlaceName.Name~"zone" -- no, we don't know
-      the zone.
-
-      FINAL ANSWER: Use the "Item" field on GatheringPoint (NOT GatheringPointBase).
-      GatheringPoint has its own Item[] array in some schema versions; check with
-      array bracket notation: +Item[]={gi_id}.
-      If that 400s too, fall back to paginating GatheringPointBase by row ID
-      (there are only ~700 rows) and scanning for gi_id in the Item array.
+    The plain +Item[]= query (no GatheringPointBase prefix) returns HTTP 400
+    from v2 -- it MUST be nested through GatheringPointBase. Zone must come
+    from TerritoryType.PlaceName, NOT PlaceName (which is the sub-landmark and
+    won't match ZONE_DATA).
     """
     try:
         # Step 1 -- find GatheringItem row(s) for this item
@@ -184,7 +186,7 @@ def get_gathering_locations(item_id):
             return []
 
         locations = []
-        seen_zones = set()
+        seen_bases = set()  # dedupe nodes that share a GatheringPointBase
 
         for gi_row in gi_rows[:3]:
             gi_id = gi_row["row_id"]
@@ -193,103 +195,50 @@ def get_gathering_locations(item_id):
             lvl_f      = lvl_obj.get("fields", {}) if isinstance(lvl_obj, dict) else {}
             gather_lvl = lvl_f.get("GatheringItemLevel", "?")
 
-            # Step 2 -- Try array-bracket search on GatheringPoint directly.
-            # GatheringPoint has an Item[] array of GatheringItem row IDs in
-            # some schema versions; if not, fall back to paginating GatheringPointBase.
-            zone_found = False
-            try:
-                gp_search = xiv_get("/search", params={
-                    "sheets": "GatheringPoint",
-                    "query": f"+Item[]={gi_id}",
-                    "fields": "TerritoryType,PlaceName,GatheringPointBase",
-                    "limit": 8,
+            # Step 2 -- nested-array search on GatheringPoint via GatheringPointBase.
+            gp_search = xiv_get("/search", params={
+                "sheets": "GatheringPoint",
+                "query": f"+GatheringPointBase.Item[]={gi_id}",
+                "fields": "TerritoryType.PlaceName.Name,PlaceName.Name,"
+                          "GatheringPointBase.GatheringType.Name",
+                "limit": 20,
+            })
+            for pt_row in gp_search.get("results", []):
+                pf = pt_row.get("fields", {})
+                # zone comes from TerritoryType.PlaceName (the map), not PlaceName
+                tt   = pf.get("TerritoryType") or {}
+                tt_f = tt.get("fields", {}) if isinstance(tt, dict) else {}
+                tt_pn   = tt_f.get("PlaceName") or {}
+                tt_pn_f = tt_pn.get("fields", {}) if isinstance(tt_pn, dict) else {}
+                zone = tt_pn_f.get("Name") or ""
+                # pinpoint landmark (nice-to-have, may be blank)
+                pn   = pf.get("PlaceName") or {}
+                pn_f = pn.get("fields", {}) if isinstance(pn, dict) else {}
+                pinpoint = pn_f.get("Name") or ""
+                # gathering job + base id (keys the coord lookup)
+                gpb   = pf.get("GatheringPointBase") or {}
+                gpb_f = gpb.get("fields", {}) if isinstance(gpb, dict) else {}
+                base_id = gpb.get("value") if isinstance(gpb, dict) else None
+                if base_id is None and isinstance(gpb, dict):
+                    base_id = gpb.get("row_id")
+                gt   = gpb_f.get("GatheringType") or {}
+                gt_f = gt.get("fields", {}) if isinstance(gt, dict) else {}
+                gtype = gt_f.get("Name", "Gathering")
+
+                if not zone or base_id is None or base_id in seen_bases:
+                    continue
+                seen_bases.add(base_id)
+
+                coords = _extract_exported_point(base_id)
+                locations.append({
+                    "zone":     zone,
+                    "pinpoint": pinpoint,
+                    "type":     gtype,
+                    "level":    gather_lvl,
+                    "x":        coords.get("x"),
+                    "y":        coords.get("y"),
+                    "radius":   coords.get("radius"),
                 })
-                for pt_row in gp_search.get("results", [])[:5]:
-                    pf   = pt_row.get("fields", {})
-                    pn   = pf.get("PlaceName") or {}
-                    pn_f = pn.get("fields", {}) if isinstance(pn, dict) else {}
-                    tn   = pf.get("TerritoryType") or {}
-                    tn_f = tn.get("fields", {}) if isinstance(tn, dict) else {}
-                    gpb  = pf.get("GatheringPointBase") or {}
-                    gpb_f = gpb.get("fields", {}) if isinstance(gpb, dict) else {}
-                    gt   = gpb_f.get("GatheringType") or {}
-                    gt_f = gt.get("fields", {}) if isinstance(gt, dict) else {}
-                    gtype = gt_f.get("Name", "Gathering")
-                    zone = pn_f.get("Name") or tn_f.get("Name") or ""
-                    if zone and zone not in seen_zones:
-                        seen_zones.add(zone)
-                        zone_found = True
-                        locations.append({
-                            "zone":  zone,
-                            "x":     None,
-                            "y":     None,
-                            "type":  gtype,
-                            "level": gather_lvl,
-                        })
-            except Exception:
-                pass  # fall through to scan approach
-
-            if zone_found:
-                continue
-
-            # Step 2b -- Fallback: scan GatheringPointBase rows (there are ~700).
-            # Fetch in pages of 100 and check if gi_id is in Item[].
-            # This is O(700 API calls) in the worst case, so cap at 5 pages.
-            for page_start in range(0, 500, 100):
-                try:
-                    page = xiv_get("/sheet/GatheringPointBase", params={
-                        "fields": "GatheringType,Item",
-                        "limit": 100,
-                        "after": page_start if page_start else None,
-                    })
-                except Exception:
-                    break
-                rows = page.get("rows", [])
-                if not rows:
-                    break
-                for gpb_row in rows:
-                    gpb_f = gpb_row.get("fields", {})
-                    items_in_base = []
-                    raw_items = gpb_f.get("Item") or []
-                    for it in raw_items:
-                        if isinstance(it, dict):
-                            items_in_base.append(it.get("value"))
-                        elif isinstance(it, int):
-                            items_in_base.append(it)
-                    if gi_id not in items_in_base:
-                        continue
-                    gpb_id = gpb_row["row_id"]
-                    gt     = gpb_f.get("GatheringType") or {}
-                    gt_f   = gt.get("fields", {}) if isinstance(gt, dict) else {}
-                    gtype  = gt_f.get("Name", "Gathering")
-                    # Now look up the GatheringPoint for this base
-                    try:
-                        pt_search = xiv_get("/search", params={
-                            "sheets": "GatheringPoint",
-                            "query": f"+GatheringPointBase={gpb_id}",
-                            "fields": "TerritoryType,PlaceName",
-                            "limit": 3,
-                        })
-                        for pt_row in pt_search.get("results", [])[:2]:
-                            pf   = pt_row.get("fields", {})
-                            pn   = pf.get("PlaceName") or {}
-                            pn_f = pn.get("fields", {}) if isinstance(pn, dict) else {}
-                            tn   = pf.get("TerritoryType") or {}
-                            tn_f = tn.get("fields", {}) if isinstance(tn, dict) else {}
-                            zone = pn_f.get("Name") or tn_f.get("Name") or ""
-                            if zone and zone not in seen_zones:
-                                seen_zones.add(zone)
-                                locations.append({
-                                    "zone":  zone,
-                                    "x":     None,
-                                    "y":     None,
-                                    "type":  gtype,
-                                    "level": gather_lvl,
-                                })
-                    except Exception:
-                        pass
-                if locations:
-                    break  # found at least one zone, stop paging
 
         return locations
     except Exception:
@@ -722,6 +671,62 @@ def api_breakdown():
     return jsonify({"tree": tree, "raw_materials": raw_materials, "grouped_materials": grouped})
 
 
+def _candidate_zones(zone_hints):
+    """All ZONE_DATA keys an item could be gathered in, given its zone hints.
+    Exact matches first, then fuzzy substring matches; de-duplicated, stable."""
+    cands = []
+    for z in zone_hints or []:
+        if z in ZONE_DATA and z not in cands:
+            cands.append(z)
+    for z in zone_hints or []:
+        if z in ZONE_DATA:
+            continue
+        for k in ZONE_DATA:
+            if (z.lower() in k.lower() or k.lower() in z.lower()) and k not in cands:
+                cands.append(k)
+    return cands
+
+
+def _assign_items_to_zones(items):
+    """Assign each item to a single gathering zone, minimizing the number of
+    distinct zones visited (a greedy hitting-set / set-cover heuristic).
+
+    Fewer zones -> fewer teleports and less travel, a strong proxy for both the
+    min-gil and min-time objectives. Items whose hints match no known zone are
+    bucketed under "Unknown". Returns {zone_name: [item_dict, ...]}.
+    """
+    entries = [(item, _candidate_zones(item.get("zones", []))) for item in items]
+
+    # Greedy set cover: repeatedly pick the zone covering the most still-
+    # unassigned items until every item with candidates is covered.
+    chosen_set = set()
+    unassigned = [i for i, (_, c) in enumerate(entries) if c]
+    while unassigned:
+        counts = {}
+        for idx in unassigned:
+            for z in entries[idx][1]:
+                counts[z] = counts.get(z, 0) + 1
+        max_cov = max(counts.values())
+        # tie-break: prefer cheaper teleport, then name, for determinism
+        best = min(
+            (z for z in counts if counts[z] == max_cov),
+            key=lambda z: (ZONE_DATA.get(z, {}).get("teleport_cost", 999), z),
+        )
+        chosen_set.add(best)
+        unassigned = [idx for idx in unassigned if best not in entries[idx][1]]
+
+    zone_items = {}
+    for item, cands in entries:
+        target = next((z for z in cands if z in chosen_set), None)
+        key = target if target else "Unknown"
+        zone_items.setdefault(key, []).append({
+            "name": item["name"],
+            "qty": item.get("total_needed", 1),
+            "icon": item.get("icon"),
+        })
+    return zone_items
+
+
 @app.route("/api/route", methods=["POST"])
 def api_route():
     """
@@ -732,37 +737,9 @@ def api_route():
     body = request.get_json()
     items = body.get("items", [])
     
-    # Build zone -> [items] mapping
-    # For items without zone data, try to look them up or assign "Unknown"
-    zone_items = {}  # zone_name -> list of item dicts
-    
-    for item in items:
-        zones = item.get("zones", [])
-        if not zones:
-            zones = ["Unknown"]
-        # Use first known zone per item for routing
-        assigned = False
-        for z in zones:
-            if z in ZONE_DATA:
-                if z not in zone_items:
-                    zone_items[z] = []
-                zone_items[z].append({"name": item["name"], "qty": item.get("total_needed", 1), "icon": item.get("icon")})
-                assigned = True
-                break
-        if not assigned:
-            # Try fuzzy match
-            for z in zones:
-                matched = next((k for k in ZONE_DATA if z.lower() in k.lower() or k.lower() in z.lower()), None)
-                if matched:
-                    if matched not in zone_items:
-                        zone_items[matched] = []
-                    zone_items[matched].append({"name": item["name"], "qty": item.get("total_needed", 1), "icon": item.get("icon")})
-                    assigned = True
-                    break
-            if not assigned:
-                if "Unknown" not in zone_items:
-                    zone_items["Unknown"] = []
-                zone_items["Unknown"].append({"name": item["name"], "qty": item.get("total_needed", 1), "icon": item.get("icon")})
+    # Assign each gathered item to a zone, consolidating shared zones so the
+    # route makes as few stops as possible (see _assign_items_to_zones).
+    zone_items = _assign_items_to_zones(items)
 
     known_zones = {z: items for z, items in zone_items.items() if z != "Unknown"}
     unknown_items = zone_items.get("Unknown", [])

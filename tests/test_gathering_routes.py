@@ -174,6 +174,40 @@ def test_api_route_item_with_no_zones_goes_to_unknown(client, no_network):
     assert len(data["unknown_items"]) == 1
 
 
+def test_api_route_consolidates_items_into_a_shared_zone(client, no_network):
+    # Item A is in {Central, Western Thanalan}; item B is in {Eastern, Western
+    # Thanalan}. Naive "first zone" routing would visit Central + Eastern (2
+    # stops); set-cover should recognize Western Thanalan covers both -> 1 stop.
+    resp = client.post("/api/route", json={
+        "items": [
+            {"name": "Ore A", "total_needed": 1,
+             "zones": ["Central Thanalan", "Western Thanalan"]},
+            {"name": "Ore B", "total_needed": 1,
+             "zones": ["Eastern Thanalan", "Western Thanalan"]},
+        ]
+    })
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["zone_count"] == 1
+    assert data["min_cost_route"]["path"] == ["Western Thanalan"]
+    # both items land on the single shared stop
+    names = {i["name"] for i in data["min_cost_route"]["steps"][0]["items"]}
+    assert names == {"Ore A", "Ore B"}
+
+
+def test_api_route_mixed_known_and_unknown_items(client, no_network):
+    resp = client.post("/api/route", json={
+        "items": [
+            {"name": "Ore A", "total_needed": 1, "zones": ["Limsa Lominsa"]},
+            {"name": "Mystery", "total_needed": 1, "zones": ["Nowhere"]},
+        ]
+    })
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["zone_count"] == 1
+    assert [u["name"] for u in data["unknown_items"]] == ["Mystery"]
+
+
 # ---------------------------------------------------------------------------
 # get_gathering_locations — the fragile multi-step XIVAPI lookup chain
 # ---------------------------------------------------------------------------
@@ -189,72 +223,59 @@ def test_gathering_locations_no_gathering_item_found(monkeypatch):
     assert get_gathering_locations(999) == []
 
 
-def test_gathering_locations_happy_path_array_bracket_search(iron_ingot_chain):
+def test_gathering_locations_full_node_detail(iron_ingot_chain):
+    # Zone must come from TerritoryType.PlaceName ("Western Thanalan"), NOT the
+    # PlaceName landmark ("Horizon's Edge"), and coords come from
+    # ExportedGatheringPoint. The two points sharing base 158 dedupe to one.
     locations = get_gathering_locations(101)
     assert locations == [
-        {"zone": "Western Thanalan", "x": None, "y": None, "type": "Mining", "level": 5}
+        {
+            "zone": "Western Thanalan",
+            "pinpoint": "Horizon's Edge",
+            "type": "Mining",
+            "level": 5,
+            "x": 300.024,
+            "y": -223.742,
+            "radius": 64,
+        }
     ]
 
 
-def test_gathering_locations_falls_back_to_paginated_scan(monkeypatch):
+def test_gathering_locations_zone_is_territory_not_landmark(iron_ingot_chain):
+    # Regression guard for the original bug: the PlaceName landmark must never
+    # be used as the routable zone (it won't match ZONE_DATA).
+    zone = get_gathering_locations(101)[0]["zone"]
+    assert zone in ZONE_DATA
+    assert zone != "Horizon's Edge"
+
+
+def test_gathering_locations_missing_coords_degrade_gracefully(monkeypatch):
     import app as app_module
 
     def fake_xiv_get(path, params=None, timeout=10):
         params = params or {}
-
         if path == "/search":
-            sheets = params.get("sheets")
-            query = params.get("query", "")
-
+            sheets, query = params.get("sheets"), params.get("query", "")
             if sheets == "GatheringItem" and query == "+Item=101":
-                return {
-                    "results": [
-                        {"row_id": 501, "fields": {
-                            "GatheringItemLevel": {"fields": {"GatheringItemLevel": 5}}
-                        }}
-                    ]
-                }
-
-            if sheets == "GatheringPoint" and query == "+Item[]=501":
-                # array-bracket search finds nothing -> should fall back to scan
-                return {"results": []}
-
-            if sheets == "GatheringPoint" and query == "+GatheringPointBase=42":
-                return {
-                    "results": [
-                        {"fields": {
-                            "PlaceName": {"fields": {"Name": "East Shroud"}},
-                            "TerritoryType": {"fields": {"Name": "East Shroud"}},
-                        }}
-                    ]
-                }
-
+                return {"results": [{"row_id": 501, "fields": {
+                    "GatheringItemLevel": {"fields": {"GatheringItemLevel": 5}}}}]}
+            if sheets == "GatheringPoint" and query == "+GatheringPointBase.Item[]=501":
+                return {"results": [{"fields": {
+                    "PlaceName": {"fields": {"Name": "Horizon's Edge"}},
+                    "TerritoryType": {"fields": {"PlaceName": {"fields": {"Name": "Western Thanalan"}}}},
+                    "GatheringPointBase": {"value": 158, "fields": {
+                        "GatheringType": {"fields": {"Name": "Mining"}}}},
+                }}]}
             raise AssertionError(f"Unexpected /search call: {params}")
-
-        if path == "/sheet/GatheringPointBase":
-            if params.get("after") not in (None,):
-                # only the first page has data in this test
-                return {"rows": []}
-            return {
-                "rows": [
-                    {
-                        "row_id": 42,
-                        "fields": {
-                            "GatheringType": {"fields": {"Name": "Logging"}},
-                            "Item": [{"value": 501}],
-                        },
-                    }
-                ]
-            }
-
-        raise AssertionError(f"Unexpected xiv_get call: path={path!r} params={params!r}")
+        if path == "/sheet/ExportedGatheringPoint/158":
+            # coord sheet missing for this base -> function must not crash
+            raise app_module.requests.HTTPError("404")
+        raise AssertionError(f"Unexpected call: {path} {params}")
 
     monkeypatch.setattr(app_module, "xiv_get", fake_xiv_get)
-
-    locations = get_gathering_locations(101)
-    assert locations == [
-        {"zone": "East Shroud", "x": None, "y": None, "type": "Logging", "level": 5}
-    ]
+    loc = get_gathering_locations(101)[0]
+    assert loc["zone"] == "Western Thanalan"
+    assert loc["x"] is None and loc["y"] is None and loc["radius"] is None
 
 
 def test_gathering_locations_swallows_top_level_exception(monkeypatch):

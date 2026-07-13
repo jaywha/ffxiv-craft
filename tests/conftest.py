@@ -33,9 +33,10 @@ def iron_ingot_chain(monkeypatch):
       <- Iron Ore (101, gathered) x2
       <- Fire Shard (102, crystal) x1
 
-    Iron Ore has one known gathering location, found via the
-    GatheringPoint array-bracket search (the "happy path" in
-    get_gathering_locations).
+    Iron Ore has one known gathering location, resolved via the nested
+    GatheringPointBase.Item[] search + ExportedGatheringPoint coord lookup
+    (the real chain used by get_gathering_locations). Response shapes mirror
+    live XIVAPI v2 captures.
     """
 
     def fake_xiv_get(path, params=None, timeout=10):
@@ -65,23 +66,29 @@ def iron_ingot_chain(monkeypatch):
                 return {"results": []}
 
             if sheets == "GatheringPoint":
-                if query == "+Item[]=501":
-                    return {
-                        "results": [
-                            {
-                                "fields": {
-                                    "PlaceName": {"fields": {"Name": "Western Thanalan"}},
-                                    "TerritoryType": {"fields": {"Name": "Western Thanalan"}},
-                                    "GatheringPointBase": {
-                                        "fields": {"GatheringType": {"fields": {"Name": "Mining"}}}
-                                    },
-                                }
-                            }
-                        ]
+                if query == "+GatheringPointBase.Item[]=501":
+                    # Two GatheringPoints sharing one base (id 158) -> the
+                    # function should dedupe to a single node.
+                    pt = {
+                        "fields": {
+                            "PlaceName": {"fields": {"Name": "Horizon's Edge"}},
+                            "TerritoryType": {
+                                "fields": {"PlaceName": {"fields": {"Name": "Western Thanalan"}}}
+                            },
+                            "GatheringPointBase": {
+                                "value": 158,
+                                "row_id": 158,
+                                "fields": {"GatheringType": {"fields": {"Name": "Mining"}}},
+                            },
+                        }
                     }
+                    return {"results": [pt, pt]}
                 return {"results": []}
 
             raise AssertionError(f"Unexpected /search call: {params}")
+
+        if path == "/sheet/ExportedGatheringPoint/158":
+            return {"fields": {"X": 300.024, "Y": -223.742, "Radius": 64}}
 
         if path == "/sheet/Recipe/1":
             return {
