@@ -716,20 +716,31 @@ def _candidate_zones(zone_hints):
     return cands
 
 
-def _assign_items_to_zones(items):
-    """Assign each item to a single gathering zone, minimizing the number of
-    distinct zones visited (a greedy hitting-set / set-cover heuristic).
+def _make_entry(item, target=None):
+    """Route-step entry for an item, enriched with the node detail for the
+    chosen zone (pinpoint/job/level/coords) when available."""
+    entry = {
+        "name": item["name"],
+        "qty": item.get("total_needed", 1),
+        "icon": item.get("icon"),
+    }
+    node = next((n for n in item.get("nodes", []) if n.get("zone") == target), None)
+    if node:
+        entry.update({
+            "pinpoint": node.get("pinpoint"),
+            "gtype": node.get("type"),
+            "level": node.get("level"),
+            "x": node.get("x"),
+            "y": node.get("y"),
+        })
+    return entry
 
-    Fewer zones -> fewer teleports and less travel, a strong proxy for both the
-    min-gil and min-time objectives. Items whose hints match no known zone are
-    bucketed under "Unknown". Returns {zone_name: [item_dict, ...]}.
-    """
-    entries = [(item, _candidate_zones(item.get("zones", []))) for item in items]
 
-    # Greedy set cover: repeatedly pick the zone covering the most still-
-    # unassigned items until every item with candidates is covered.
-    chosen_set = set()
-    unassigned = [i for i, (_, c) in enumerate(entries) if c]
+def _greedy_set_cover(entries, indices):
+    """Pick a small set of zones covering every item in `indices`, greedily
+    taking the zone that covers the most still-uncovered items."""
+    chosen = set()
+    unassigned = list(indices)
     while unassigned:
         counts = {}
         for idx in unassigned:
@@ -741,30 +752,50 @@ def _assign_items_to_zones(items):
             (z for z in counts if counts[z] == max_cov),
             key=lambda z: (ZONE_DATA.get(z, {}).get("teleport_cost", 999), z),
         )
-        chosen_set.add(best)
+        chosen.add(best)
         unassigned = [idx for idx in unassigned if best not in entries[idx][1]]
+    return chosen
+
+
+def _assign_items_to_zones(items):
+    """Assign items to gathering zones. Returns (zone_items, unknown, flexible).
+
+    Two phases so crystals never force a detour:
+      1. Set-cover the "anchor" items (ores, logs, reagents) into the fewest
+         zones -- these are what actually justify travel.
+      2. Fold crystals in ONLY where one of their (many) zones is already being
+         visited. Crystals that fit nowhere go to `flexible` (gather passively /
+         buy on the Market Board) rather than adding a dedicated stop.
+
+    Items whose hints match no known zone go to `unknown` (mob drops, vendor).
+    """
+    entries = []  # (item, candidate_zones, is_crystal)
+    for item in items:
+        cands = _candidate_zones(item.get("zones", []))
+        entries.append((item, cands, item.get("source") == "crystal"))
+
+    # Phase 1: set-cover the anchor (non-crystal) items that have zones.
+    anchor_idx = [i for i, (_, c, is_cry) in enumerate(entries) if c and not is_cry]
+    chosen_set = _greedy_set_cover(entries, anchor_idx)
 
     zone_items = {}
-    for item, cands in entries:
+    unknown, flexible = [], []
+    for item, cands, is_crystal in entries:
+        if not cands:
+            # crystals with no node data are still "buy/passive", not errors
+            (flexible if is_crystal else unknown).append(_make_entry(item))
+            continue
         target = next((z for z in cands if z in chosen_set), None)
-        key = target if target else "Unknown"
-        # attach the node detail matching the chosen zone, if any
-        node = next((n for n in item.get("nodes", []) if n.get("zone") == target), None)
-        entry = {
-            "name": item["name"],
-            "qty": item.get("total_needed", 1),
-            "icon": item.get("icon"),
-        }
-        if node:
-            entry.update({
-                "pinpoint": node.get("pinpoint"),
-                "gtype": node.get("type"),
-                "level": node.get("level"),
-                "x": node.get("x"),
-                "y": node.get("y"),
-            })
-        zone_items.setdefault(key, []).append(entry)
-    return zone_items
+        if is_crystal and target is None:
+            # fold-in only: no already-visited zone -> do not add a stop
+            flexible.append(_make_entry(item))
+            continue
+        if target is None:
+            # anchor item somehow uncovered; give it its own stop
+            target = cands[0]
+            chosen_set.add(target)
+        zone_items.setdefault(target, []).append(_make_entry(item, target))
+    return zone_items, unknown, flexible
 
 
 @app.route("/api/route", methods=["POST"])
@@ -777,18 +808,17 @@ def api_route():
     body = request.get_json()
     items = body.get("items", [])
     
-    # Assign each gathered item to a zone, consolidating shared zones so the
-    # route makes as few stops as possible (see _assign_items_to_zones).
-    zone_items = _assign_items_to_zones(items)
+    # Consolidate anchor items into as few stops as possible and fold crystals
+    # into those stops where they fit (see _assign_items_to_zones).
+    known_zones, unknown_items, flexible_items = _assign_items_to_zones(items)
 
-    known_zones = {z: items for z, items in zone_items.items() if z != "Unknown"}
-    unknown_items = zone_items.get("Unknown", [])
-    
     if not known_zones:
         return jsonify({
             "min_cost_route": None,
             "min_time_route": None,
             "unknown_items": unknown_items,
+            "flexible_items": flexible_items,
+            "zone_count": 0,
             "message": "No zone data available for any items. Try gathering location lookup first."
         })
     
@@ -799,6 +829,7 @@ def api_route():
         "min_cost_route": min_cost_route,
         "min_time_route": min_time_route,
         "unknown_items": unknown_items,
+        "flexible_items": flexible_items,
         "zone_count": len(known_zones),
     })
 
@@ -819,7 +850,10 @@ def api_lookup_zones():
         source = item.get("source", "other")
         zones = []
         nodes = []
-        if source == "gathered" and iid:
+        # Crystals/shards are gathered too (as node yields), and each is
+        # available in many zones -- so they usually fold into a stop already
+        # on the route. Mob drops / "other" have no gathering nodes; skip them.
+        if source in ("gathered", "crystal") and iid:
             try:
                 nodes = get_gathering_locations(iid)
                 zones = [n["zone"] for n in nodes if n.get("zone") and n["zone"] != "Unknown"]
@@ -1000,6 +1034,8 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .step-item img{width:16px;height:16px;border-radius:2px}
 .step-item-qty{color:var(--gold2);font-family:'Cinzel',serif;font-size:11px}
 .route-unknown{margin-top:12px;padding:10px 14px;background:var(--orange-dim);border:1px solid var(--orange);border-radius:var(--r);font-size:12px;color:var(--orange)}
+.route-flex{margin-top:12px;padding:10px 14px;background:var(--teal-dim);border:1px solid var(--teal);border-radius:var(--r);font-size:12px;color:var(--teal)}
+.route-flex strong{display:block;margin-bottom:4px;font-family:'Cinzel',serif;letter-spacing:.08em}
 .route-unknown strong{display:block;margin-bottom:4px;font-family:'Cinzel',serif;letter-spacing:.08em}
 .zone-badge{display:inline-flex;align-items:center;gap:4px;padding:1px 6px;border-radius:3px;font-size:10px;background:var(--bg3);border:1px solid var(--border);color:var(--text3);cursor:pointer;transition:border-color .15s}
 .zone-badge:hover{border-color:var(--teal-dim);color:var(--teal)}
@@ -1370,6 +1406,7 @@ function renderRouteSection(container, data, allItems) {
   const minC = data.min_cost_route;
   const minT = data.min_time_route;
   const unknown = data.unknown_items || [];
+  const flexible = data.flexible_items || [];
 
   let html = `<div class="route-section">
     <div class="route-header">
@@ -1387,9 +1424,16 @@ function renderRouteSection(container, data, allItems) {
     <div class="route-tc" id="rtab-time">${renderRoute(minT)}</div>`;
   }
 
+  if (flexible.length) {
+    html += `<div class="route-flex"><strong>&#9670; Crystals & Shards</strong>
+      Gather these passively while you route, or buy them cheaply on the Market Board — no detour needed:<br>
+      ${flexible.map(u => `<span style="color:var(--text2)">${u.name} ×${u.qty}</span>`).join(' · ')}
+    </div>`;
+  }
+
   if (unknown.length) {
     html += `<div class="route-unknown"><strong>&#9888; Items Without Zone Data</strong>
-      These items couldn't be matched to a known zone — check Garland Tools for locations:<br>
+      These aren't gathered (mob drops, vendor, etc.) — check Garland Tools for sources:<br>
       ${unknown.map(u => `<span style="color:var(--text2)">${u.name} ×${u.qty}</span>`).join(' · ')}
     </div>`;
   }

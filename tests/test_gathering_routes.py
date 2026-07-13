@@ -240,6 +240,57 @@ def test_api_route_mixed_known_and_unknown_items(client, no_network):
     assert [u["name"] for u in data["unknown_items"]] == ["Mystery"]
 
 
+def test_api_route_folds_crystal_into_visited_zone(client, no_network):
+    # A crystal available in a zone the route already visits should fold into
+    # that stop (no new zone), and not appear in flexible/unknown.
+    resp = client.post("/api/route", json={
+        "items": [
+            {"name": "Copper Ore", "total_needed": 1, "zones": ["Central Thanalan"]},
+            {"name": "Lightning Shard", "total_needed": 2, "source": "crystal",
+             "zones": ["Southern Thanalan", "Central Thanalan"]},
+        ]
+    })
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["zone_count"] == 1
+    names = {i["name"] for i in data["min_cost_route"]["steps"][0]["items"]}
+    assert names == {"Copper Ore", "Lightning Shard"}
+    assert data["flexible_items"] == []
+
+
+def test_api_route_crystal_without_overlap_is_flexible_not_a_stop(client, no_network):
+    # A crystal whose zones don't overlap the route must NOT add a dedicated
+    # stop; it goes to flexible (buy/passive), never to unknown.
+    resp = client.post("/api/route", json={
+        "items": [
+            {"name": "Copper Ore", "total_needed": 1, "zones": ["Central Thanalan"]},
+            {"name": "Fire Shard", "total_needed": 2, "source": "crystal",
+             "zones": ["Middle La Noscea", "Eastern Thanalan"]},
+        ]
+    })
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["zone_count"] == 1  # Fire Shard did not add a stop
+    assert [i["name"] for i in data["flexible_items"]] == ["Fire Shard"]
+    assert all(u["name"] != "Fire Shard" for u in data["unknown_items"])
+
+
+def test_api_route_crystal_only_all_flexible(client, no_network):
+    # With no anchor items, there are no visited zones to fold into, so every
+    # crystal is flexible and no route is produced.
+    resp = client.post("/api/route", json={
+        "items": [
+            {"name": "Fire Shard", "total_needed": 2, "source": "crystal",
+             "zones": ["Middle La Noscea", "Eastern Thanalan"]},
+        ]
+    })
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["zone_count"] == 0
+    assert data["min_cost_route"] is None
+    assert [i["name"] for i in data["flexible_items"]] == ["Fire Shard"]
+
+
 # ---------------------------------------------------------------------------
 # get_gathering_locations — the fragile multi-step XIVAPI lookup chain
 # ---------------------------------------------------------------------------
@@ -335,9 +386,22 @@ def test_lookup_zones_fills_zones_for_gathered_items(client, iron_ingot_chain):
     assert data[0]["zones"] == ["Western Thanalan"]
 
 
-def test_lookup_zones_skips_non_gathered_sources(client, no_network):
+def test_lookup_zones_also_looks_up_crystals(client, iron_ingot_chain):
+    # Crystals are gathered too, so they must be looked up (item 101 stands in
+    # for a crystal here; only the source string drives the code path).
     resp = client.post("/api/lookup_zones", json={
-        "items": [{"item_id": 102, "name": "Fire Shard", "source": "crystal"}]
+        "items": [{"item_id": 101, "name": "Fire Shard", "source": "crystal"}]
+    })
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data[0]["zones"] == ["Western Thanalan"]
+
+
+def test_lookup_zones_skips_mob_drop_and_other_sources(client, no_network):
+    # "other" (mob drops, vendor items) have no gathering nodes -> not looked
+    # up (no_network asserts get_gathering_locations is never called).
+    resp = client.post("/api/lookup_zones", json={
+        "items": [{"item_id": 999, "name": "Bloody Bardiche Head", "source": "other"}]
     })
     assert resp.status_code == 200
     data = resp.get_json()
