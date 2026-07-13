@@ -1,21 +1,19 @@
 # FFXIV Craft Planner
 
-A local web app for planning Grand Company supply & provision quests in Final Fantasy XIV.
+A local web app for planning crafting and gathering in Final Fantasy XIV. Add the
+items you want to craft, see every material they break down into, and get an
+optimal route for gathering it all.
 
 ## Requirements
 
 - Python 3.10 or newer — https://python.org
-- Internet connection (uses XIVAPI for live recipe data)
+- Internet connection (uses [XIVAPI](https://xivapi.com) for live recipe & gathering data — free, no API key)
 
 ## Quick Start
 
 ### Windows
-Double-click `launch.bat`
-
-That's it. The script will:
-1. Check that Python is installed
-2. Auto-install Flask and Requests if missing
-3. Open your browser to http://localhost:5000
+Double-click `launch.bat`. It checks Python, installs Flask + Requests if needed,
+and opens http://localhost:5000.
 
 ### Mac / Linux
 ```bash
@@ -23,32 +21,55 @@ chmod +x launch.sh
 ./launch.sh
 ```
 
+### Manually
+```bash
+pip install -r requirements.txt
+python app.py
+```
+Then open http://localhost:5000.
+
 ## How to Use
 
-1. **Search** — Type an item name in the search box and hit Search. Use the quantity field to set how many you need.
+1. **Search** for an item by name.
+2. **Click a result** to add it to your **Items to Craft** list. Set a
+   **quantity** for each item; add as many different items as you like.
+3. **Calculate Materials** — expands every target into its full recipe tree and
+   shows a single **aggregated** gathering log (shared materials are summed
+   across all your targets).
+4. **Plan Gathering Route** — computes an optimal route across the FFXIV zones to
+   gather everything, in two flavors you can toggle between:
+   - **Min Cost** — fewest gil spent on teleports
+   - **Min Time** — fastest travel
 
-2. **Select** — Click the item from the results list.
+Each stop lists the materials found there with the gathering job, node level,
+in-zone landmark, and map coordinates (e.g. `X: 26.7, Y: 25.7`).
 
-3. **Mark what you have** — Click "Calculate Breakdown" first to see the ingredient tree.
-   On any leaf ingredient (raw material), click **"Have Some?"** to add it to the "Items I Already Have" panel.
-   Enter how many you already have — those will be subtracted from the required totals.
+## About the route
 
-4. **Recalculate** — Hit "Calculate Breakdown" again. Any component you have enough of will be crossed out in the tree.
-
-5. **Gathering List** — Scroll down to see your material list:
-   - **By Source** tab: split into Gathered / Crystals / Mob Drops / Other
-   - **All Totals** tab: flat sorted list of everything
-   - Click any item in the gathering list to tick it off as you collect it
-
-## Tips
-
-- For **provision quests** (gather X of item Y), just search the raw material directly and set the quantity.
-- For **supply quests** (craft X), search the finished item. The tree will recursively break down every sub-component.
-- The "Have Some?" button only appears on raw/leaf materials. For intermediate crafted items, add their sub-materials instead.
-- The gathering list persists your tick-marks while the page is open — recalculating will refresh it.
+- **Fewest stops.** Most materials can be gathered in several zones; the planner
+  consolidates them into the fewest shared zones to minimise teleports and travel.
+- **Crystals & Shards** are handled separately. They're gatherable almost
+  everywhere, so they're folded into stops you're already making — and any that
+  don't fit are listed under a note to gather passively or buy on the Market
+  Board, rather than sending you on a detour.
+- **Items Without Zone Data** — anything that isn't gathered (mob drops, vendor
+  items) is listed here to source elsewhere.
 
 ## Notes
 
-- Recipe data comes from [XIVAPI](https://xivapi.com) — free, no API key needed.
-- Source classification (gathered vs. mob drop) is based on item category from XIVAPI and is a best-effort guess. Some items may be miscategorised.
-- The app runs entirely locally. No data is sent anywhere except XIVAPI for recipe lookups.
+- Recipe, gathering, and coordinate data all come live from XIVAPI v2.
+- Source classification (gathered / crystal / crafted / other) is a best-effort
+  guess from the item's category and may occasionally be off.
+- Teleport costs and travel times are approximate — good for choosing *which*
+  zones to visit; treat the gil/minute totals as estimates.
+- The app runs entirely locally; the only network calls are to XIVAPI.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests mock all XIVAPI calls, so they run offline. CI runs the suite on Python
+3.10–3.12 (`.github/workflows/ci.yml`). See `CLAUDE.md` for architecture notes.
