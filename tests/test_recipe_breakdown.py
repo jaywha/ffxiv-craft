@@ -130,3 +130,51 @@ def test_breakdown_have_items_reduces_or_eliminates_need(client, iron_ingot_chai
     # fully-satisfied raw materials are not added to raw_materials/grouped_materials
     assert "101" not in data["raw_materials"]
     assert all(m["item_id"] != 101 for m in data["grouped_materials"]["gathered"])
+
+
+# ---------------------------------------------------------------------------
+# /api/breakdown_multi (several targets, materials aggregated)
+# ---------------------------------------------------------------------------
+
+def test_breakdown_multi_aggregates_shared_materials(client, iron_ingot_chain):
+    # Target 1: Iron Ingot x1  -> Iron Ore x2, Fire Shard x1
+    # Target 2: Iron Ore x5    -> Iron Ore x5 (raw)
+    # Iron Ore must sum across both targets: 2 + 5 = 7.
+    resp = client.post("/api/breakdown_multi", json={"targets": [
+        {"item_id": 100, "quantity": 1},
+        {"item_id": 101, "quantity": 5},
+    ]})
+    assert resp.status_code == 200
+    data = resp.get_json()
+
+    # per-target trees returned in order, with names/quantities
+    assert [t["name"] for t in data["targets"]] == ["Iron Ingot", "Iron Ore"]
+    assert [t["quantity"] for t in data["targets"]] == [1, 5]
+    assert data["targets"][0]["tree"]["item_id"] == 100
+
+    # shared material summed across targets
+    assert data["raw_materials"]["101"]["total_needed"] == 7
+    gathered = {m["item_id"]: m["total_needed"] for m in data["grouped_materials"]["gathered"]}
+    assert gathered[101] == 7
+    crystal = {m["item_id"]: m["total_needed"] for m in data["grouped_materials"]["crystal"]}
+    assert crystal[102] == 1
+
+
+def test_breakdown_multi_skips_invalid_targets(client, iron_ingot_chain):
+    resp = client.post("/api/breakdown_multi", json={"targets": [
+        {"item_id": 100, "quantity": 1},
+        {"item_id": 100, "quantity": 0},   # qty < 1 -> skipped
+        {"quantity": 2},                    # missing item_id -> skipped
+    ]})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert len(data["targets"]) == 1
+    assert data["targets"][0]["quantity"] == 1
+
+
+def test_breakdown_multi_empty_targets(client, no_network):
+    resp = client.post("/api/breakdown_multi", json={"targets": []})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["targets"] == []
+    assert data["grouped_materials"] == {"gathered": [], "crystal": [], "other": []}

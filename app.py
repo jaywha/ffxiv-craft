@@ -608,44 +608,39 @@ def api_debug_gathering(item_id):
         import traceback
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
-@app.route("/api/breakdown", methods=["POST"])
-def api_breakdown():
-    body       = request.get_json()
-    item_id    = int(body["item_id"])
-    quantity   = int(body.get("quantity", 1))
-    have_items = {str(k): int(v) for k, v in body.get("have_items", {}).items()}
+def _fetch_info(iid, cache):
+    if iid not in cache:
+        try:
+            cache[iid] = get_item_info(iid)
+        except Exception:
+            cache[iid] = {"id": iid, "name": f"Item {iid}", "icon": None, "ui_category": ""}
+    return cache[iid]
 
-    item_cache   = {}
-    recipe_cache = {}
-    raw_materials = {}
 
-    def fetch_info(iid):
-        if iid not in item_cache:
-            try:
-                item_cache[iid] = get_item_info(iid)
-            except Exception:
-                item_cache[iid] = {"id": iid, "name": f"Item {iid}", "icon": None, "ui_category": ""}
-        return item_cache[iid]
+def _fetch_recipe(iid, cache):
+    if iid not in cache:
+        try:
+            cache[iid] = find_recipe(iid)
+        except Exception:
+            cache[iid] = None
+    return cache[iid]
 
-    def fetch_recipe(iid):
-        if iid not in recipe_cache:
-            try:
-                recipe_cache[iid] = find_recipe(iid)
-            except Exception:
-                recipe_cache[iid] = None
-        return recipe_cache[iid]
 
+def build_material_tree(item_id, quantity, have_items, item_cache, recipe_cache, raw_materials):
+    """Expand item_id into an ingredient tree, accumulating leaf/raw materials
+    into raw_materials. raw_materials sums total_needed across calls, so several
+    targets can share one dict to aggregate their shared materials."""
     def build(iid, qty_needed, depth=0, ing_name=None, ing_icon=None, ing_cat=""):
         have      = have_items.get(str(iid), 0)
         qty_after = max(0, qty_needed - have)
 
-        recipe     = fetch_recipe(iid)
+        recipe     = _fetch_recipe(iid, recipe_cache)
         has_recipe = bool(recipe and recipe.get("ingredients"))
 
         if ing_name:
             name, icon, cat = ing_name, ing_icon, ing_cat
         else:
-            info = fetch_info(iid)
+            info = _fetch_info(iid, item_cache)
             name, icon, cat = info["name"], info["icon"], info["ui_category"]
 
         src = classify(name, cat, has_recipe)
@@ -683,11 +678,14 @@ def api_breakdown():
 
         return node
 
-    root_info = fetch_info(item_id)
-    tree = build(item_id, quantity,
+    root_info = _fetch_info(item_id, item_cache)
+    return build(item_id, quantity,
                  ing_name=root_info["name"], ing_icon=root_info["icon"],
                  ing_cat=root_info["ui_category"])
 
+
+def group_materials(raw_materials):
+    """Bucket accumulated raw materials into gathered / crystal / other."""
     grouped = {"gathered": [], "crystal": [], "other": []}
     for iid, mat in raw_materials.items():
         src = mat["source"] if mat["source"] in grouped else "other"
@@ -696,8 +694,53 @@ def api_breakdown():
                               "gather_sources": [], "has_mob_drop": src == "other"})
     for src in grouped:
         grouped[src].sort(key=lambda x: x["name"])
+    return grouped
 
+
+@app.route("/api/breakdown", methods=["POST"])
+def api_breakdown():
+    body       = request.get_json()
+    item_id    = int(body["item_id"])
+    quantity   = int(body.get("quantity", 1))
+    have_items = {str(k): int(v) for k, v in body.get("have_items", {}).items()}
+
+    item_cache, recipe_cache, raw_materials = {}, {}, {}
+    tree = build_material_tree(item_id, quantity, have_items,
+                               item_cache, recipe_cache, raw_materials)
+    grouped = group_materials(raw_materials)
     return jsonify({"tree": tree, "raw_materials": raw_materials, "grouped_materials": grouped})
+
+
+@app.route("/api/breakdown_multi", methods=["POST"])
+def api_breakdown_multi():
+    """Break down several target items at once and aggregate their materials.
+
+    Body: { targets: [{item_id, quantity}, ...], have_items?: {id: qty} }
+    Returns per-target trees plus raw_materials / grouped_materials summed
+    across every target, so shared sub-materials add up into one list."""
+    body = request.get_json()
+    targets = body.get("targets", [])
+    have_items = {str(k): int(v) for k, v in body.get("have_items", {}).items()}
+
+    item_cache, recipe_cache, raw_materials = {}, {}, {}
+    out_targets = []
+    for t in targets:
+        try:
+            iid = int(t["item_id"])
+            qty = int(t.get("quantity", 1))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if qty < 1:
+            continue
+        tree = build_material_tree(iid, qty, have_items,
+                                   item_cache, recipe_cache, raw_materials)
+        info = _fetch_info(iid, item_cache)
+        out_targets.append({"item_id": iid, "name": info["name"],
+                            "icon": info["icon"], "quantity": qty, "tree": tree})
+
+    grouped = group_materials(raw_materials)
+    return jsonify({"targets": out_targets, "raw_materials": raw_materials,
+                    "grouped_materials": grouped})
 
 
 def _candidate_zones(zone_hints):
@@ -919,6 +962,10 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .ni-check{width:18px;height:18px;border:1px solid var(--border2);border-radius:3px;display:flex;align-items:center;justify-content:center;font-size:11px;cursor:pointer;flex-shrink:0;transition:background .15s,border-color .15s;color:var(--green)}
 .ni-row.collected .ni-check{background:var(--green-dim);border-color:var(--green)}
 .rbtn{background:var(--red-dim);border-color:var(--red);color:var(--red);font-size:10px;padding:4px 8px;font-family:'Lato',sans-serif}
+.ni-row .tgt-qty{width:52px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--gold2);font-family:'Cinzel',serif;font-size:12px;padding:3px 6px;text-align:center}
+.tgt-head{display:flex;align-items:center;gap:8px;cursor:pointer;padding-bottom:8px;margin-bottom:8px;border-bottom:1px solid var(--border)}
+.tgt-title{flex:1;font-family:'Cinzel',serif;font-size:13px;color:var(--gold2)}
+.tgt-toggle{color:var(--text3);font-size:12px}
 .rbtn:hover{background:var(--red);color:white}
 .action-row{padding:16px 20px;border-top:1px solid var(--border);background:var(--bg2);display:flex;flex-direction:column;gap:8px}
 .btn-primary{width:100%;padding:10px;font-size:12px;letter-spacing:.12em;background:linear-gradient(135deg,#3d2c0a,#6b4c10);border-color:var(--gold);color:var(--gold2)}
@@ -1070,15 +1117,15 @@ button:disabled{opacity:.4;cursor:not-allowed}
     <div id="stbar" class="status-bar" style="display:none"></div>
     <div id="sr" class="search-results"></div>
 
-    <!-- Needed Item List -->
+    <!-- Items to Craft (targets) -->
     <div class="needed-panel">
-      <div class="panel-label">&#9654; Needed Item List</div>
-      <div class="nil-hint">Items added from breakdown. Check off as you collect them.</div>
-      <div id="nil"><div class="empty">No items tracked yet.<br>Run a breakdown, then click <strong style="color:var(--teal)">&#43; Track</strong> on any material.</div></div>
+      <div class="panel-label">&#9654; Items to Craft</div>
+      <div class="nil-hint">Search above and click a result to add it here. Set a quantity per item, then calculate.</div>
+      <div id="nil"><div class="empty">No target items yet.<br>Search and click a result to add it.</div></div>
     </div>
 
     <div class="action-row">
-      <button class="btn-primary" id="bb" disabled>&#9658; Calculate Breakdown</button>
+      <button class="btn-primary" id="bb" disabled>&#9658; Calculate Materials</button>
       <button class="btn-route" id="brb" disabled>&#9650; Plan Gathering Route</button>
     </div>
   </aside>
@@ -1086,7 +1133,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
   <main class="main" id="ma">
     <div class="welcome" id="ws">
       <h2>Craft Planner</h2>
-      <p>Search for an item, select it, then calculate the full material breakdown. Track what you need, then plan an efficient gathering route.</p>
+      <p>Search for the items you want to craft and add each to your list with a quantity. Calculate to see the combined materials, then plan one optimal gathering route.</p>
       <div class="hint">Recipe &amp; gathering data via XIVAPI · TSP route optimization included</div>
     </div>
   </main>
@@ -1096,6 +1143,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 // ---- State ----
 const S = {
   sel: null,
+  targets: [], // [{id, name, icon, qty}]
   neededItems: {}, // id -> {id, name, icon, qty_needed, source, collected, zones}
   loaded: false,
   lastGrouped: null,
@@ -1139,97 +1187,103 @@ function renderResults(items) {
     row.innerHTML = `${item.icon ? `<img class="iico" src="${item.icon}" alt="">` : '<div class="iico-ph"></div>'}
       <div><div class="iname">${item.name}</div><div class="iid">ID: ${item.id}</div></div>`;
     row.onclick = () => {
-      document.querySelectorAll('.sri').forEach(r => r.classList.remove('sel'));
+      addTarget(item);
       row.classList.add('sel');
-      S.sel = item;
-      $('bb').disabled = false;
+      setTimeout(() => row.classList.remove('sel'), 250);
     };
     el.appendChild(row);
   });
 }
 
-// ---- Needed Item List ----
-function addNeededItem(item) {
+// ---- Items to Craft (targets) ----
+function addTarget(item) {
   const key = String(item.id);
-  if (S.neededItems[key]) return; // already tracked
-  S.neededItems[key] = {
-    id: item.id,
-    name: item.name,
-    icon: item.icon || null,
-    qty_needed: item.qty_needed || 1,
-    source: item.source || 'other',
-    collected: false,
-    zones: [],
-  };
-  renderNeededList();
-  $('brb').disabled = Object.keys(S.neededItems).length === 0;
+  if (S.targets.some(t => String(t.id) === key)) return; // already added
+  const qty = Math.max(1, parseInt($('qi').value) || 1);
+  S.targets.push({ id: item.id, name: item.name, icon: item.icon || null, qty });
+  renderTargets();
 }
 
-function renderNeededList() {
+function renderTargets() {
   const el = $('nil');
-  const items = Object.values(S.neededItems);
-  if (!items.length) {
-    el.innerHTML = '<div class="empty">No items tracked yet.<br>Run a breakdown, then click <strong style="color:var(--teal)">&#43; Track</strong> on any material.</div>';
-    $('brb').disabled = true;
+  if (!S.targets.length) {
+    el.innerHTML = '<div class="empty">No target items yet.<br>Search and click a result to add it.</div>';
+    $('bb').disabled = true;
     return;
   }
   el.innerHTML = '';
-  items.forEach(item => {
+  S.targets.forEach(t => {
     const row = document.createElement('div');
-    row.className = 'ni-row' + (item.collected ? ' collected' : '');
+    row.className = 'ni-row';
     row.innerHTML = `
-      <div class="ni-check" data-id="${item.id}">${item.collected ? '✓' : ''}</div>
-      ${item.icon ? `<img src="${item.icon}" alt="">` : '<div class="ni-img-ph"></div>'}
-      <span class="ni-name">${item.name}</span>
-      <span class="ni-qty">×${item.qty_needed}</span>
-      <button class="rbtn" data-id="${item.id}" title="Remove">✕</button>`;
-    row.querySelector('.ni-check').onclick = e => {
-      const id = e.currentTarget.dataset.id;
-      S.neededItems[id].collected = !S.neededItems[id].collected;
-      renderNeededList();
+      ${t.icon ? `<img src="${t.icon}" alt="">` : '<div class="ni-img-ph"></div>'}
+      <span class="ni-name">${t.name}</span>
+      <input type="number" class="tgt-qty" min="1" value="${t.qty}" data-id="${t.id}" title="Quantity to craft">
+      <button class="rbtn" data-id="${t.id}" title="Remove">✕</button>`;
+    row.querySelector('.tgt-qty').onchange = e => {
+      const tt = S.targets.find(x => String(x.id) === String(e.currentTarget.dataset.id));
+      if (tt) tt.qty = Math.max(1, parseInt(e.currentTarget.value) || 1);
+      e.currentTarget.value = tt ? tt.qty : 1;
     };
     row.querySelector('.rbtn').onclick = e => {
-      delete S.neededItems[e.currentTarget.dataset.id];
-      renderNeededList();
-      $('brb').disabled = Object.keys(S.neededItems).length === 0;
+      S.targets = S.targets.filter(x => String(x.id) !== String(e.currentTarget.dataset.id));
+      renderTargets();
     };
     el.appendChild(row);
   });
-  $('brb').disabled = false;
+  $('bb').disabled = false;
 }
 
-// ---- Breakdown ----
+// Derive the gathering-route input set from aggregated gathered + crystal mats.
+function setRouteItems(grouped) {
+  S.neededItems = {};
+  ['gathered', 'crystal'].forEach(src => {
+    (grouped[src] || []).forEach(m => {
+      S.neededItems[String(m.item_id)] = {
+        id: m.item_id, name: m.name, icon: m.icon || null,
+        qty_needed: m.total_needed, source: src, collected: false, zones: [],
+      };
+    });
+  });
+  $('brb').disabled = Object.keys(S.neededItems).length === 0;
+}
+
+// ---- Calculate (multi-target breakdown) ----
 $('bb').onclick = async function() {
-  if (!S.sel) return;
-  const qty = parseInt($('qi').value) || 1;
-  setStatus('Fetching recipe tree...');
+  if (!S.targets.length) return;
+  setStatus('Fetching recipe trees...');
   $('bb').disabled = true;
   try {
-    const r = await fetch('/api/breakdown', {
+    const r = await fetch('/api/breakdown_multi', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({item_id: S.sel.id, quantity: qty, have_items: {}})
+      body: JSON.stringify({targets: S.targets.map(t => ({item_id: t.id, quantity: t.qty}))})
     });
     const d = await r.json();
     S.lastGrouped = d.grouped_materials;
     S.lastRaw = d.raw_materials;
     setStatus('');
-    renderBreakdown(d, S.sel.name, qty);
+    renderMultiBreakdown(d);
+    setRouteItems(d.grouped_materials);
   } catch(e) { setStatus('Breakdown failed.', true); }
   $('bb').disabled = false;
 };
 
-function renderBreakdown(data, name, qty) {
+function renderMultiBreakdown(data) {
   const ma = $('ma');
   if ($('ws')) $('ws').style.display = 'none';
   if (!window._ck) window._ck = {};
+  const targets = data.targets || [];
+  const title = targets.length === 1
+    ? `Recipe Tree — ${targets[0].name} ×${targets[0].quantity}`
+    : `Recipe Trees — ${targets.length} Targets`;
   ma.innerHTML = `
     <div>
-      <div class="sec-title">Recipe Tree — ${name} ×${qty}</div>
-      <div class="tree-card" id="tc"></div>
+      <div class="sec-title">${title}</div>
+      <div id="trees"></div>
     </div>
     <div>
-      <div class="sec-title">Gathering &amp; Collection Log</div>
+      <div class="sec-title">Aggregated Gathering &amp; Collection Log</div>
       <div class="tabs">
         <div class="tab active" data-tab="cl">Checklist</div>
         <div class="tab" data-tab="tot">All Totals</div>
@@ -1246,7 +1300,30 @@ function renderBreakdown(data, name, qty) {
     ma.querySelector('#tab-' + t.dataset.tab).classList.add('active');
   });
 
-  renderTree(data.tree, $('tc'), 0);
+  const treesEl = $('trees');
+  const multi = targets.length > 1;
+  targets.forEach(tg => {
+    const card = document.createElement('div');
+    card.className = 'tree-card';
+    card.style.marginBottom = '12px';
+    const body = document.createElement('div');
+    if (multi) {
+      const head = document.createElement('div');
+      head.className = 'tgt-head';
+      head.innerHTML = `${tg.icon ? `<img class="nico" src="${tg.icon}" alt="">` : '<div class="nico-ph"></div>'}`
+        + `<span class="tgt-title">${tg.name} ×${tg.quantity}</span><span class="tgt-toggle">▾</span>`;
+      head.onclick = () => {
+        const hidden = body.style.display === 'none';
+        body.style.display = hidden ? '' : 'none';
+        head.querySelector('.tgt-toggle').textContent = hidden ? '▾' : '▸';
+      };
+      card.appendChild(head);
+    }
+    renderTree(tg.tree, body, 0);
+    card.appendChild(body);
+    treesEl.appendChild(card);
+  });
+
   renderChecklist(data.grouped_materials, $('tab-cl'));
   renderTotals(data.raw_materials, $('tab-tot'));
 }
@@ -1264,7 +1341,6 @@ function renderTree(node, container, depth) {
     <div class="ninfo"><div class="nname">${node.name}</div><div class="nmeta">${sb2}${cm ? '&nbsp;' + cm : ''}</div></div>
     <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
       <span class="qty${sat ? ' sat' : ''}">×${node.qty_needed}</span>
-      ${isLeafItem ? `<button class="ahb" data-id="${node.item_id}" data-name="${node.name}" data-icon="${node.icon||''}" data-qty="${node.qty_to_craft_or_gather}" data-src="${node.source}">+ Track</button>` : ''}
     </div>`;
   rw.appendChild(row); wrap.appendChild(rw);
   if (node.children && node.children.length) {
@@ -1273,17 +1349,6 @@ function renderTree(node, container, depth) {
     wrap.appendChild(cc);
   }
   container.appendChild(wrap);
-  row.querySelectorAll('.ahb').forEach(b => b.onclick = () => {
-    addNeededItem({
-      id: b.dataset.id,
-      name: b.dataset.name,
-      icon: b.dataset.icon || null,
-      qty_needed: parseInt(b.dataset.qty) || 1,
-      source: b.dataset.src || 'other',
-    });
-    b.textContent = '✓ Tracked';
-    b.disabled = true;
-  });
 }
 
 function renderChecklist(grouped, container) {
