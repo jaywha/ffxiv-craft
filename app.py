@@ -148,6 +148,15 @@ def _extract_exported_point(base_id):
         return {}
 
 
+def _to_map_coord(raw, size_factor=100, offset=0):
+    """Convert a raw world coordinate to the in-game 2D map coordinate
+    (the numbers shown on the player map). Returns None if raw is missing."""
+    if raw is None:
+        return None
+    c = (size_factor or 100) / 100.0
+    return round((41.0 / c) * (((raw + (offset or 0)) * c + 1024.0) / 2048.0) + 1.0, 1)
+
+
 def get_gathering_locations(item_id):
     """Return list of gathering nodes for a gathered item, each shaped:
         {zone, pinpoint, type, level, x, y, radius}
@@ -200,6 +209,8 @@ def get_gathering_locations(item_id):
                 "sheets": "GatheringPoint",
                 "query": f"+GatheringPointBase.Item[]={gi_id}",
                 "fields": "TerritoryType.PlaceName.Name,PlaceName.Name,"
+                          "TerritoryType.Map.SizeFactor,TerritoryType.Map.OffsetX,"
+                          "TerritoryType.Map.OffsetY,"
                           "GatheringPointBase.GatheringType.Name",
                 "limit": 20,
             })
@@ -211,6 +222,12 @@ def get_gathering_locations(item_id):
                 tt_pn   = tt_f.get("PlaceName") or {}
                 tt_pn_f = tt_pn.get("fields", {}) if isinstance(tt_pn, dict) else {}
                 zone = tt_pn_f.get("Name") or ""
+                # map scale/offset for converting node coords to map coords
+                mp   = tt_f.get("Map") or {}
+                mp_f = mp.get("fields", {}) if isinstance(mp, dict) else {}
+                size_factor = mp_f.get("SizeFactor") or 100
+                off_x = mp_f.get("OffsetX") or 0
+                off_y = mp_f.get("OffsetY") or 0
                 # pinpoint landmark (nice-to-have, may be blank)
                 pn   = pf.get("PlaceName") or {}
                 pn_f = pn.get("fields", {}) if isinstance(pn, dict) else {}
@@ -235,8 +252,8 @@ def get_gathering_locations(item_id):
                     "pinpoint": pinpoint,
                     "type":     gtype,
                     "level":    gather_lvl,
-                    "x":        coords.get("x"),
-                    "y":        coords.get("y"),
+                    "x":        _to_map_coord(coords.get("x"), size_factor, off_x),
+                    "y":        _to_map_coord(coords.get("y"), size_factor, off_y),
                     "radius":   coords.get("radius"),
                 })
 
@@ -719,11 +736,22 @@ def _assign_items_to_zones(items):
     for item, cands in entries:
         target = next((z for z in cands if z in chosen_set), None)
         key = target if target else "Unknown"
-        zone_items.setdefault(key, []).append({
+        # attach the node detail matching the chosen zone, if any
+        node = next((n for n in item.get("nodes", []) if n.get("zone") == target), None)
+        entry = {
             "name": item["name"],
             "qty": item.get("total_needed", 1),
             "icon": item.get("icon"),
-        })
+        }
+        if node:
+            entry.update({
+                "pinpoint": node.get("pinpoint"),
+                "gtype": node.get("type"),
+                "level": node.get("level"),
+                "x": node.get("x"),
+                "y": node.get("y"),
+            })
+        zone_items.setdefault(key, []).append(entry)
     return zone_items
 
 
@@ -778,14 +806,15 @@ def api_lookup_zones():
         iid = item.get("item_id")
         source = item.get("source", "other")
         zones = []
+        nodes = []
         if source == "gathered" and iid:
             try:
-                locs = get_gathering_locations(iid)
-                zones = [loc["zone"] for loc in locs if loc.get("zone") and loc["zone"] != "Unknown"]
+                nodes = get_gathering_locations(iid)
+                zones = [n["zone"] for n in nodes if n.get("zone") and n["zone"] != "Unknown"]
                 zones = list(dict.fromkeys(zones))  # deduplicate
             except Exception:
-                zones = []
-        results.append({**item, "zones": zones})
+                zones, nodes = [], []
+        results.append({**item, "zones": zones, "nodes": nodes})
     
     return jsonify(results)
 
@@ -951,7 +980,11 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .step-cost{font-size:11px;color:var(--gold2);font-family:'Cinzel',serif}
 .step-time{font-size:11px;color:var(--blue)}
 .step-items{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid var(--border)}
-.step-item{display:flex;align-items:center;gap:5px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:3px 8px;font-size:11px;color:var(--text2)}
+.step-item{display:flex;flex-direction:column;gap:2px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:11px;color:var(--text2)}
+.step-item-head{display:flex;align-items:center;gap:5px}
+.step-item-name{color:var(--text)}
+.step-item-meta{color:var(--green);font-size:10px;letter-spacing:.02em}
+.step-item-coords{color:var(--gold2);font-family:'Cinzel',serif;font-size:10px}
 .step-item img{width:16px;height:16px;border-radius:2px}
 .step-item-qty{color:var(--gold2);font-family:'Cinzel',serif;font-size:11px}
 .route-unknown{margin-top:12px;padding:10px 14px;background:var(--orange-dim);border:1px solid var(--orange);border-radius:var(--r);font-size:12px;color:var(--orange)}
@@ -1400,12 +1433,20 @@ function renderRoute(route) {
           ${timeLabel ? `<span class="step-time">${timeLabel}</span>` : ''}
         </div>
         <div class="step-items">
-          ${(step.items||[]).map(it => `
+          ${(step.items||[]).map(it => {
+            const coords = (it.x != null && it.y != null) ? `X: ${it.x}, Y: ${it.y}` : '';
+            const meta = [it.gtype, (it.level!=null && it.level!=='?') ? `Lv ${it.level}` : '', it.pinpoint]
+              .filter(Boolean).join(' · ');
+            return `
             <div class="step-item">
-              ${it.icon ? `<img src="${it.icon}" alt="">` : ''}
-              ${it.name}
-              <span class="step-item-qty">×${it.qty}</span>
-            </div>`).join('')}
+              <div class="step-item-head">
+                ${it.icon ? `<img src="${it.icon}" alt="">` : ''}
+                <span class="step-item-name">${it.name}</span>
+                <span class="step-item-qty">×${it.qty}</span>
+              </div>
+              ${meta ? `<div class="step-item-meta">${meta}</div>` : ''}
+              ${coords ? `<div class="step-item-coords">${coords}</div>` : ''}
+            </div>`;}).join('')}
         </div>
       </div>
     </div>`;

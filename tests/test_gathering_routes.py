@@ -2,6 +2,7 @@ import math
 
 from app import (
     ZONE_DATA,
+    _to_map_coord,
     build_route,
     get_gathering_locations,
     solve_tsp_nearest_neighbor,
@@ -9,6 +10,26 @@ from app import (
     travel_time_minutes,
     zone_distance,
 )
+
+
+# ---------------------------------------------------------------------------
+# _to_map_coord (raw world coords -> in-game map coords)
+# ---------------------------------------------------------------------------
+
+def test_to_map_coord_default_size_factor():
+    # Iron Ore node raw coords -> the familiar Western Thanalan map numbers.
+    assert _to_map_coord(300.024) == 27.5
+    assert _to_map_coord(-223.742) == 17.0
+
+
+def test_to_map_coord_respects_size_factor():
+    # A larger SizeFactor compresses the map, shifting coords toward center.
+    assert _to_map_coord(0, size_factor=100) == 21.5
+    assert _to_map_coord(0, size_factor=200) == 11.2
+
+
+def test_to_map_coord_none_passthrough():
+    assert _to_map_coord(None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -228,14 +249,16 @@ def test_gathering_locations_full_node_detail(iron_ingot_chain):
     # PlaceName landmark ("Horizon's Edge"), and coords come from
     # ExportedGatheringPoint. The two points sharing base 158 dedupe to one.
     locations = get_gathering_locations(101)
+    # x/y are converted from raw world coords (300.024, -223.742) to in-game
+    # map coords via _to_map_coord with the default SizeFactor of 100.
     assert locations == [
         {
             "zone": "Western Thanalan",
             "pinpoint": "Horizon's Edge",
             "type": "Mining",
             "level": 5,
-            "x": 300.024,
-            "y": -223.742,
+            "x": 27.5,
+            "y": 17.0,
             "radius": 64,
         }
     ]
