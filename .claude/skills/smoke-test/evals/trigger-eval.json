@@ -1,0 +1,22 @@
+[
+  {"query": "I just reworked the zone assignment in api_route — can you spin up the ffxiv craft planner and confirm the route still renders right?", "should_trigger": true},
+  {"query": "run the craft planner, add Bronze Ingot and a Cross-pein Hammer as targets, calculate and plan the route, and tell me if there are any console errors", "should_trigger": true},
+  {"query": "I edited the breakdown_multi aggregation, make sure nothing broke end to end in the app before I commit", "should_trigger": true},
+  {"query": "does the crystals & shards fold-in note still show up in the route UI after my change to _assign_items_to_zones?", "should_trigger": true},
+  {"query": "can you take a screenshot of the planner with a couple of targets and a computed route so I can see it?", "should_trigger": true},
+  {"query": "verify the multi-target flow still works after my edits to the embedded JS", "should_trigger": true},
+  {"query": "start the app and check that adding two items and planning a route actually works", "should_trigger": true},
+  {"query": "smoke test the planner for me, I changed how the aggregated gathering log renders", "should_trigger": true},
+  {"query": "add a new zone to ZONE_DATA for the Dawntrail region with its teleport cost and coords", "should_trigger": false},
+  {"query": "write a pytest case for parse_recipe covering an ingredient with a zero amount", "should_trigger": false},
+  {"query": "explain how the repeated nearest-neighbor TSP solver picks the starting zone", "should_trigger": false},
+  {"query": "the CI workflow is red on python 3.10 — look at the pytest output and figure out what failed", "should_trigger": false},
+  {"query": "update the README to describe the new crystal fold-in behavior", "should_trigger": false},
+  {"query": "why does get_gathering_locations return an empty list for item 12345? dig into the XIVAPI calls", "should_trigger": false},
+  {"query": "bump the flask version in requirements.txt and make sure the lockfile is consistent", "should_trigger": false},
+  {"query": "refactor classify() to use a dict lookup instead of the keyword loops", "should_trigger": false},
+  {"query": "how do I deploy this Flask app to a small VPS behind nginx?", "should_trigger": false},
+  {"query": "add a loading spinner to the search box while results are fetching", "should_trigger": false},
+  {"query": "grep the codebase for everywhere we call xiv_get and list the endpoints we depend on", "should_trigger": false},
+  {"query": "the app.py edit keeps failing with 'string to replace not found' — what's going on with this file?", "should_trigger": false}
+]
