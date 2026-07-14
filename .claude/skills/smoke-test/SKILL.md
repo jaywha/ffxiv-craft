@@ -1,14 +1,18 @@
 ---
 name: smoke-test
 description: >-
-  End-to-end smoke test for the ffxiv-craft app. Use this whenever you've
-  changed app.py — its Flask routes, the recipe-breakdown logic, the gathering
-  route/zone code, or the embedded HTML/CSS/JS — and want to confirm the whole
-  flow still works before calling a change done, or whenever asked to run,
-  verify, screenshot, or "check the app works" in the browser. Drives the real
-  UI (search → add targets → calculate materials → plan route) and checks for
-  errors. Prefer this over ad-hoc manual checking; it encodes the flow and the
-  known gotchas (port conflicts, screenshot timeouts, CRLF editing).
+  Run the ffxiv-craft app and verify it works end-to-end. Use this when you want
+  to confirm the app still behaves correctly after a change — or when asked to
+  run, start, launch, verify, screenshot, or "check the app works" — especially
+  for changes to its Flask routes, recipe breakdown, gathering-route/zone logic,
+  or embedded UI. Drives the real browser flow (search → add target items →
+  calculate materials → plan route) and checks the console for errors, with a
+  fast backend-only path via test_client for pure-logic changes. Also captures
+  the app's verification gotchas (screenshots time out here; port 5000
+  leftovers) and the CRLF rule for editing app.py. NOT for merely editing or
+  refactoring the code, writing pytest unit tests, debugging one function's
+  logic in isolation, CI/dependency/deploy problems, or documentation — reach
+  for it when the goal is to see the running app behave correctly.
 ---
 
 # ffxiv-craft smoke test
