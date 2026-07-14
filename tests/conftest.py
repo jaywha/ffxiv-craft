@@ -10,6 +10,37 @@ def client():
         yield c
 
 
+@pytest.fixture(autouse=True)
+def auth_disabled_by_default(monkeypatch):
+    """Run the suite with AUTH_DISABLED on by default so endpoint tests exercise
+    the persistence/route logic without an OAuth session (get_current_user_id
+    falls back to the 'local' user). Auth-specific tests opt back into real auth
+    via the `auth_enabled` fixture, which sets the flag False after this one."""
+    monkeypatch.setattr(app_module, "AUTH_DISABLED", True)
+
+
+@pytest.fixture
+def auth_enabled(monkeypatch):
+    """Turn real auth back on for a test: get_current_user_id() then reads the
+    session and unauthenticated requests get 401. Runs after the autouse
+    default, so its False wins."""
+    monkeypatch.setattr(app_module, "AUTH_DISABLED", False)
+    return monkeypatch
+
+
+@pytest.fixture
+def temp_db(tmp_path, monkeypatch):
+    """Point the app at a throwaway SQLite file for the duration of a test.
+
+    db() reads app.config["DB_PATH"] on every connection and runs
+    CREATE TABLE IF NOT EXISTS, so setting the path is all that's needed --
+    each test gets a fresh, isolated database with no leftover state.
+    """
+    db_file = tmp_path / "test.db"
+    monkeypatch.setitem(app_module.app.config, "DB_PATH", str(db_file))
+    return db_file
+
+
 @pytest.fixture
 def no_network(monkeypatch):
     """Replace xiv_get with a stub that fails loudly on any unmocked call."""

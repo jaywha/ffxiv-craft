@@ -8,6 +8,7 @@ optimal route for gathering it all.
 
 - Python 3.10 or newer — https://python.org
 - Internet connection (uses [XIVAPI](https://xivapi.com) for live recipe & gathering data — free, no API key)
+- (Optional) A Google account to sign in and save routes across devices — or run with `AUTH_DISABLED=1` for a single local profile (see Development)
 
 ## Quick Start
 
@@ -44,6 +45,16 @@ Then open http://localhost:5000.
 Each stop lists the materials found there with the gathering job, node level,
 in-zone landmark, and map coordinates (e.g. `X: 26.7, Y: 25.7`).
 
+## Sign in & your Library
+
+Sign in with Google (top-right) to keep a **Library** in the sidebar: your
+recent searches and any routes you save. Click **★ Save Route** on a computed
+route to store its targets and results; reopen or delete saved routes from the
+Library.
+
+Running locally without setting up Google sign-in? Start with `AUTH_DISABLED=1`
+(see Development) and the app uses a single local profile — the Library still works.
+
 ## About the route
 
 - **Fewest stops.** Most materials can be gathered in several zones; the planner
@@ -70,6 +81,12 @@ in-zone landmark, and map coordinates (e.g. `X: 26.7, Y: 25.7`).
 pip install -r requirements-dev.txt
 pytest
 ```
+
+**Optional — Google sign-in.** Set `FLASK_SECRET_KEY`, `GOOGLE_CLIENT_ID`, and
+`GOOGLE_CLIENT_SECRET` (a Google Cloud OAuth *Web* client, redirect URI
+`http://localhost:5000/auth/callback`) to enable per-user saved routes across
+devices. Or set `AUTH_DISABLED=1` to skip OAuth entirely and use a single local
+profile. History and saved routes live in a local `ffxiv_craft.db` (SQLite).
 
 Tests mock all XIVAPI calls, so they run offline. CI runs the suite on Python
 3.10–3.12 (`.github/workflows/ci.yml`). See `CLAUDE.md` for architecture notes.
