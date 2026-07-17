@@ -1,7 +1,27 @@
-from flask import Flask, jsonify, request, Response
-import requests, math, itertools
+from flask import Flask, jsonify, request, Response, session, redirect, url_for
+import requests, math, itertools, sqlite3, os, json
+from contextlib import contextmanager
+from authlib.integrations.flask_client import OAuth
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-insecure-secret-change-me")
+
+# --- Auth config (Authlib "Sign in with Google") -------------------------
+# AUTH_DISABLED lets local dev / tests run without a Google OAuth client:
+# get_current_user_id() then falls back to the single 'local' placeholder user.
+AUTH_DISABLED = os.environ.get("AUTH_DISABLED", "").lower() in ("1", "true", "yes")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+
+oauth = OAuth(app)
+if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+    oauth.register(
+        name="google",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+        client_kwargs={"scope": "openid email profile"},
+    )
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "ffxiv-craft-planner/1.0"})
@@ -440,6 +460,167 @@ def build_route(zones, cost_fn, label):
     }
 
 # ---------------------------------------------------------------------------
+# Persistence (SQLite, stdlib only)
+#
+# Keyed by an internal user id. For now there is a single placeholder user
+# (external_id='local'); when auth lands, get_current_user_id() swaps to the
+# authenticated identity (e.g. a Google `sub`) and nothing downstream changes.
+# ---------------------------------------------------------------------------
+
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffxiv_craft.db")
+
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    external_id  TEXT UNIQUE NOT NULL,
+    display_name TEXT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS search_history (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    query      TEXT,
+    item_id    INTEGER,
+    item_name  TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS saved_routes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name         TEXT,
+    targets_json TEXT NOT NULL,
+    route_json   TEXT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+
+def _db_path():
+    return app.config.get("DB_PATH") or DEFAULT_DB_PATH
+
+
+@contextmanager
+def db():
+    """Open a SQLite connection with the schema ensured. Commits on clean exit,
+    always closes. CREATE TABLE IF NOT EXISTS makes first-run init lazy and is
+    cheap enough to run per-connection -- which keeps tests on temp DBs simple."""
+    conn = sqlite3.connect(_db_path())
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        conn.executescript(_SCHEMA_SQL)
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_or_create_user(external_id="local", display_name=None):
+    """Return the internal user id for external_id, inserting the row if new."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id FROM users WHERE external_id = ?", (external_id,)
+        ).fetchone()
+        if row:
+            return row["id"]
+        cur = conn.execute(
+            "INSERT INTO users (external_id, display_name) VALUES (?, ?)",
+            (external_id, display_name),
+        )
+        return cur.lastrowid
+
+
+def get_current_user_id():
+    """Internal id of the acting user, or None when nobody is signed in.
+
+    AUTH_DISABLED (local dev / offline / tests) short-circuits to the single
+    'local' placeholder user. Otherwise the id comes from the session stamped
+    by the OAuth callback; endpoints that require a user gate on None -> 401.
+    """
+    if AUTH_DISABLED:
+        return get_or_create_user("local")
+    return session.get("user_id")
+
+
+def record_search(user_id, query=None, item_id=None, item_name=None):
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO search_history (user_id, query, item_id, item_name) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, query, item_id, item_name),
+        )
+        return cur.lastrowid
+
+
+def recent_searches(user_id, limit=20):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, query, item_id, item_name, created_at FROM search_history "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def save_route(user_id, name, targets, route):
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO saved_routes (user_id, name, targets_json, route_json) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, name, json.dumps(targets),
+             json.dumps(route) if route is not None else None),
+        )
+        return cur.lastrowid
+
+
+def _loads(s):
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def list_saved_routes(user_id):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, name, targets_json, created_at FROM saved_routes "
+            "WHERE user_id = ? ORDER BY id DESC",
+            (user_id,),
+        ).fetchall()
+    return [{
+        "id": r["id"], "name": r["name"], "created_at": r["created_at"],
+        "targets": _loads(r["targets_json"]) or [],
+    } for r in rows]
+
+
+def get_saved_route(user_id, route_id):
+    with db() as conn:
+        r = conn.execute(
+            "SELECT id, name, targets_json, route_json, created_at FROM saved_routes "
+            "WHERE id = ? AND user_id = ?",
+            (route_id, user_id),
+        ).fetchone()
+    if not r:
+        return None
+    return {
+        "id": r["id"], "name": r["name"], "created_at": r["created_at"],
+        "targets": _loads(r["targets_json"]) or [],
+        "route": _loads(r["route_json"]),
+    }
+
+
+def delete_saved_route(user_id, route_id):
+    with db() as conn:
+        cur = conn.execute(
+            "DELETE FROM saved_routes WHERE id = ? AND user_id = ?",
+            (route_id, user_id),
+        )
+        return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
 # Flask routes
 # ---------------------------------------------------------------------------
 
@@ -453,9 +634,16 @@ def api_search():
     if not q:
         return jsonify([])
     try:
-        return jsonify(search_items_xiv(q))
+        results = search_items_xiv(q)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    uid = get_current_user_id()
+    if uid is not None:
+        try:
+            record_search(uid, query=q)
+        except Exception:
+            pass  # history is best-effort; never fail a search over it
+    return jsonify(results)
 
 @app.route("/api/debug/search/<path:query>")
 def api_debug_search(query):
@@ -909,6 +1097,119 @@ def api_lookup_zones():
 
 
 # ---------------------------------------------------------------------------
+# Auth routes (Authlib "Sign in with Google")
+# ---------------------------------------------------------------------------
+
+@app.route("/api/me")
+def api_me():
+    """Who is signed in -- drives the header control and Library gating."""
+    if AUTH_DISABLED:
+        return jsonify({"authenticated": True, "display_name": "Local", "auth_disabled": True})
+    if session.get("user_id"):
+        return jsonify({"authenticated": True, "display_name": session.get("display_name")})
+    return jsonify({"authenticated": False})
+
+
+@app.route("/login")
+def login():
+    client = oauth.create_client("google")
+    if client is None:
+        return jsonify({"error": "Google OAuth is not configured on this server."}), 503
+    redirect_uri = url_for("auth_callback", _external=True)
+    return client.authorize_redirect(redirect_uri)
+
+
+@app.route("/auth/callback")
+def auth_callback():
+    client = oauth.create_client("google")
+    if client is None:
+        return jsonify({"error": "Google OAuth is not configured on this server."}), 503
+    token = client.authorize_access_token()  # verifies the Google ID token
+    userinfo = token.get("userinfo") or {}
+    if not userinfo.get("sub"):
+        # Fallback for Authlib builds that don't auto-attach userinfo to the
+        # token: query the OIDC userinfo endpoint with the freshly issued token.
+        try:
+            userinfo = client.userinfo(token=token) or userinfo
+        except Exception:
+            pass
+    sub = userinfo.get("sub")
+    if not sub:
+        return jsonify({"error": "Google did not return an account id."}), 400
+    name = userinfo.get("name") or userinfo.get("email") or "Adventurer"
+    uid = get_or_create_user(external_id="google:" + sub, display_name=name)
+    session["user_id"] = uid
+    session["display_name"] = name
+    return redirect(url_for("index"))
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.pop("user_id", None)
+    session.pop("display_name", None)
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Persistence endpoints (search history + saved routes), scoped to the user
+# ---------------------------------------------------------------------------
+
+@app.route("/api/history", methods=["GET", "POST"])
+def api_history():
+    user_id = get_current_user_id()
+    if user_id is None:
+        return jsonify({"error": "authentication required"}), 401
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        query = body.get("query")
+        item_name = body.get("item_name")
+        item_id = body.get("item_id")
+        if item_id is not None:
+            try:
+                item_id = int(item_id)
+            except (TypeError, ValueError):
+                item_id = None
+        if not query and item_id is None and not item_name:
+            return jsonify({"error": "nothing to record"}), 400
+        entry_id = record_search(user_id, query=query, item_id=item_id, item_name=item_name)
+        return jsonify({"id": entry_id}), 201
+    limit = request.args.get("limit", 20, type=int)
+    return jsonify(recent_searches(user_id, limit=limit))
+
+
+@app.route("/api/routes", methods=["GET", "POST"])
+def api_routes():
+    user_id = get_current_user_id()
+    if user_id is None:
+        return jsonify({"error": "authentication required"}), 401
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        targets = body.get("targets")
+        if not isinstance(targets, list) or not targets:
+            return jsonify({"error": "targets (non-empty list) required"}), 400
+        name = (body.get("name") or "").strip() or None
+        route = body.get("route")
+        route_id = save_route(user_id, name, targets, route)
+        return jsonify({"id": route_id}), 201
+    return jsonify(list_saved_routes(user_id))
+
+
+@app.route("/api/routes/<int:route_id>", methods=["GET", "DELETE"])
+def api_route_detail(route_id):
+    user_id = get_current_user_id()
+    if user_id is None:
+        return jsonify({"error": "authentication required"}), 401
+    if request.method == "DELETE":
+        if delete_saved_route(user_id, route_id):
+            return jsonify({"deleted": route_id})
+        return jsonify({"error": "not found"}), 404
+    rec = get_saved_route(user_id, route_id)
+    if not rec:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(rec)
+
+
+# ---------------------------------------------------------------------------
 # Embedded HTML
 # ---------------------------------------------------------------------------
 
@@ -1095,6 +1396,39 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .welcome h2{font-family:'Cinzel',serif;font-size:22px;color:var(--gold);font-weight:400}
 .welcome p{color:var(--text3);font-size:13px;max-width:340px;line-height:1.8}
 .welcome .hint{font-size:11px;color:var(--text3);border:1px solid var(--border);border-radius:var(--r);padding:8px 14px;margin-top:8px}
+/* ---- Library (search history + saved routes) ---- */
+.library-panel{border-top:1px solid var(--border);background:var(--bg2);flex-shrink:0}
+.lib-head{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;cursor:pointer;user-select:none}
+.lib-head:hover{background:var(--bg3)}
+.lib-head .panel-label{margin:0}
+.lib-caret{color:var(--text3);font-size:11px;transition:transform .15s}
+.lib-caret.open{transform:rotate(90deg)}
+.lib-body{padding:0 16px 14px;max-height:40vh;overflow-y:auto}
+.lib-tabs{display:flex;gap:0;margin-bottom:10px;border-bottom:1px solid var(--border)}
+.lib-tab{padding:6px 12px;font-family:'Cinzel',serif;font-size:10px;letter-spacing:.08em;color:var(--text3);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;text-transform:uppercase}
+.lib-tab.active{color:var(--gold);border-bottom-color:var(--gold)}
+.lib-tc{display:none}
+.lib-tc.active{display:block}
+.lib-item{display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);margin-bottom:6px}
+.lib-item-main{flex:1;min-width:0;cursor:pointer}
+.lib-item-name{font-size:12px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lib-item-meta{font-size:10px;color:var(--text3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lib-del{background:var(--red-dim);border-color:var(--red);color:var(--red);font-size:10px;padding:3px 8px;font-family:'Lato',sans-serif;letter-spacing:0}
+.lib-del:hover{background:var(--red);color:#fff}
+.hist-row{display:flex;align-items:center;gap:8px;padding:6px 4px;font-size:12px;color:var(--text2);border-bottom:1px solid var(--border);cursor:pointer}
+.hist-row:last-child{border-bottom:none}
+.hist-row:hover{color:var(--text)}
+.hist-q{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hist-time{font-size:10px;color:var(--text3);flex-shrink:0}
+.save-route-btn{background:var(--teal-dim);border-color:var(--teal);color:var(--teal);font-size:10px;padding:5px 11px;font-family:'Lato',sans-serif;letter-spacing:.02em}
+.save-route-btn:hover{background:var(--teal);color:var(--bg)}
+/* ---- Auth (header control) ---- */
+.auth-area{margin-left:auto;display:flex;align-items:center;gap:10px}
+.user-chip{font-family:'Cinzel',serif;font-size:12px;color:var(--gold2);letter-spacing:.04em}
+.signin-btn{font-family:'Lato',sans-serif;font-size:12px;letter-spacing:.02em;padding:7px 14px;background:var(--gold-dim);border-color:var(--gold);color:var(--gold2)}
+.signin-btn:hover{background:var(--gold);color:var(--bg)}
+.signout-btn{font-family:'Lato',sans-serif;font-size:11px;letter-spacing:.02em;padding:5px 10px;background:transparent;border-color:var(--border2);color:var(--text2)}
+.signout-btn:hover{border-color:var(--red);color:var(--red);background:transparent}
 </style>
 </head>
 <body>
@@ -1103,6 +1437,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
     <div class="logo">FFXIV <span>Craft Planner</span></div>
     <div class="sub">Grand Company Supply &amp; Provision Helper</div>
   </div>
+  <div class="auth-area" id="auth-area"></div>
 </header>
 <div class="layout">
   <aside class="sidebar">
@@ -1128,6 +1463,21 @@ button:disabled{opacity:.4;cursor:not-allowed}
       <button class="btn-primary" id="bb" disabled>&#9658; Calculate Materials</button>
       <button class="btn-route" id="brb" disabled>&#9650; Plan Gathering Route</button>
     </div>
+
+    <div class="library-panel">
+      <div class="lib-head" id="lib-toggle">
+        <span class="panel-label">&#9733; Library</span>
+        <span class="lib-caret" id="lib-caret">&#9656;</span>
+      </div>
+      <div class="lib-body" id="lib-body" style="display:none">
+        <div class="lib-tabs">
+          <div class="lib-tab active" data-lib="routes">Saved Routes</div>
+          <div class="lib-tab" data-lib="history">History</div>
+        </div>
+        <div class="lib-tc active" id="lib-routes"><div class="empty">Loading&hellip;</div></div>
+        <div class="lib-tc" id="lib-history"><div class="empty">Loading&hellip;</div></div>
+      </div>
+    </div>
   </aside>
 
   <main class="main" id="ma">
@@ -1148,6 +1498,9 @@ const S = {
   loaded: false,
   lastGrouped: null,
   lastRaw: null,
+  lastRouteData: null,
+  lastRouteItems: null,
+  auth: null,
 };
 
 const $ = id => document.getElementById(id);
@@ -1201,6 +1554,7 @@ function addTarget(item) {
   if (S.targets.some(t => String(t.id) === key)) return; // already added
   const qty = Math.max(1, parseInt($('qi').value) || 1);
   S.targets.push({ id: item.id, name: item.name, icon: item.icon || null, qty });
+  recordItemHistory(item);
   renderTargets();
 }
 
@@ -1461,6 +1815,8 @@ $('brb').onclick = async function() {
     });
     const routeData = await routeR.json();
 
+    S.lastRouteData = routeData;
+    S.lastRouteItems = itemsWithZones;
     renderRouteSection(rsc, routeData, itemsWithZones);
   } catch(e) {
     rsc.innerHTML = `<div class="route-section"><div class="err" style="padding:16px">Route planning failed: ${e.message}</div></div>`;
@@ -1476,6 +1832,7 @@ function renderRouteSection(container, data, allItems) {
   let html = `<div class="route-section">
     <div class="route-header">
       <div class="route-title">&#9650; Gathering Route — ${data.zone_count || 0} Zone${(data.zone_count||0)!==1?'s':''}</div>
+      <button class="save-route-btn" id="save-route-btn">&#9733; Save Route</button>
     </div>`;
 
   if (!minC && !minT) {
@@ -1505,6 +1862,9 @@ function renderRouteSection(container, data, allItems) {
 
   html += '</div>';
   container.innerHTML = html;
+
+  const sbtn = container.querySelector('#save-route-btn');
+  if (sbtn) sbtn.onclick = saveCurrentRoute;
 
   // Tab switching
   container.querySelectorAll('.route-tab').forEach(t => t.onclick = () => {
@@ -1576,6 +1936,157 @@ function renderRoute(route) {
   html += '</div>';
   return html;
 }
+// ---- Library: search history + saved routes ----
+function libTime(ts) {
+  if (!ts) return '';
+  // stored as UTC "YYYY-MM-DD HH:MM:SS"
+  const d = new Date(ts.replace(' ', 'T') + 'Z');
+  return isNaN(d) ? ts : d.toLocaleString();
+}
+
+function recordItemHistory(item) {
+  fetch('/api/history', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({item_id: item.id, item_name: item.name})
+  }).catch(() => {});
+}
+
+async function loadHistory() {
+  const el = $('lib-history');
+  try {
+    const r = await fetch('/api/history?limit=25');
+    const rows = await r.json();
+    if (!Array.isArray(rows) || !rows.length) {
+      el.innerHTML = '<div class="empty">No search history yet.</div>'; return;
+    }
+    el.innerHTML = '';
+    rows.forEach(h => {
+      const label = h.item_name || h.query || '(empty)';
+      const row = document.createElement('div');
+      row.className = 'hist-row';
+      row.innerHTML = `<span class="hist-q">${label}</span><span class="hist-time">${libTime(h.created_at)}</span>`;
+      row.title = h.item_id ? `Add ${label} to targets` : `Search "${label}" again`;
+      row.onclick = () => {
+        if (h.item_id) addTarget({id: h.item_id, name: h.item_name || label, icon: null});
+        else if (h.query) { $('si').value = h.query; doSearch(); }
+      };
+      el.appendChild(row);
+    });
+  } catch(e) { el.innerHTML = '<div class="empty">Could not load history.</div>'; }
+}
+
+async function loadSavedRoutes() {
+  const el = $('lib-routes');
+  try {
+    const r = await fetch('/api/routes');
+    const rows = await r.json();
+    if (!Array.isArray(rows) || !rows.length) {
+      el.innerHTML = '<div class="empty">No saved routes yet.</div>'; return;
+    }
+    el.innerHTML = '';
+    rows.forEach(rt => {
+      const tgts = rt.targets || [];
+      const names = tgts.map(t => t.name + (t.qty ? ` ×${t.qty}` : '')).join(', ');
+      const item = document.createElement('div');
+      item.className = 'lib-item';
+      item.innerHTML = `
+        <div class="lib-item-main">
+          <div class="lib-item-name">${rt.name || 'Untitled route'}</div>
+          <div class="lib-item-meta">${tgts.length} target${tgts.length!==1?'s':''}${names?' · '+names:''}</div>
+        </div>
+        <button class="lib-del">Delete</button>`;
+      item.querySelector('.lib-item-main').onclick = () => loadRoute(rt.id);
+      item.querySelector('.lib-del').onclick = e => { e.stopPropagation(); deleteRoute(rt.id); };
+      el.appendChild(item);
+    });
+  } catch(e) { el.innerHTML = '<div class="empty">Could not load saved routes.</div>'; }
+}
+
+async function loadRoute(id) {
+  setStatus('Loading saved route…');
+  try {
+    const r = await fetch('/api/routes/' + id);
+    if (!r.ok) throw new Error('not found');
+    const rec = await r.json();
+    S.targets = (rec.targets || []).map(t => ({
+      id: t.id, name: t.name, icon: t.icon || null,
+      qty: Math.max(1, parseInt(t.qty) || 1)
+    }));
+    renderTargets();
+    setStatus('');
+    // Rebuild the breakdown (and re-enable route planning) from restored targets.
+    if (S.targets.length) $('bb').onclick();
+  } catch(e) { setStatus('Could not load route.', true); }
+}
+
+async function deleteRoute(id) {
+  try {
+    const r = await fetch('/api/routes/' + id, {method: 'DELETE'});
+    if (r.ok) loadSavedRoutes();
+  } catch(e) {}
+}
+
+async function saveCurrentRoute() {
+  if (!S.targets.length) return;
+  const def = S.targets.map(t => t.name).join(', ');
+  const name = prompt('Name this route:', def);
+  if (name === null) return; // cancelled
+  try {
+    const r = await fetch('/api/routes', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name, targets: S.targets, route: S.lastRouteData || null})
+    });
+    if (r.ok) {
+      if ($('lib-body').style.display === 'none') toggleLibrary(true);
+      else loadSavedRoutes();
+    }
+  } catch(e) {}
+}
+
+function toggleLibrary(open) {
+  const body = $('lib-body'), caret = $('lib-caret');
+  const show = open === undefined ? body.style.display === 'none' : open;
+  body.style.display = show ? '' : 'none';
+  caret.classList.toggle('open', show);
+  if (show) { loadSavedRoutes(); loadHistory(); }
+}
+
+$('lib-toggle').onclick = () => toggleLibrary();
+document.querySelectorAll('.lib-tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.lib-tab').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.lib-tc').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  $('lib-' + t.dataset.lib).classList.add('active');
+});
+// ---- Auth (header control + Library gating) ----
+async function initAuth() {
+  try {
+    const r = await fetch('/api/me');
+    S.auth = await r.json();
+  } catch(e) { S.auth = {authenticated: false}; }
+  renderAuth(S.auth);
+}
+
+function renderAuth(me) {
+  const el = $('auth-area');
+  const lib = document.querySelector('.library-panel');
+  if (me && me.authenticated) {
+    const signout = me.auth_disabled ? ''
+      : '<button class="signout-btn" id="signout">Sign out</button>';
+    el.innerHTML = `<span class="user-chip">${me.display_name || 'Signed in'}</span>${signout}`;
+    const so = $('signout');
+    if (so) so.onclick = async () => { await fetch('/logout', {method: 'POST'}); location.reload(); };
+    if (lib) lib.style.display = '';
+  } else {
+    el.innerHTML = '<button class="signin-btn" id="signin">Sign in with Google</button>';
+    $('signin').onclick = () => { location.href = '/login'; };
+    if (lib) lib.style.display = 'none';
+  }
+}
+
+initAuth();
 </script>
 </body>
 </html>"""
