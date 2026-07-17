@@ -1126,6 +1126,13 @@ def auth_callback():
         return jsonify({"error": "Google OAuth is not configured on this server."}), 503
     token = client.authorize_access_token()  # verifies the Google ID token
     userinfo = token.get("userinfo") or {}
+    if not userinfo.get("sub"):
+        # Fallback for Authlib builds that don't auto-attach userinfo to the
+        # token: query the OIDC userinfo endpoint with the freshly issued token.
+        try:
+            userinfo = client.userinfo(token=token) or userinfo
+        except Exception:
+            pass
     sub = userinfo.get("sub")
     if not sub:
         return jsonify({"error": "Google did not return an account id."}), 400
