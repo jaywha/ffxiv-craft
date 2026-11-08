@@ -11,7 +11,8 @@ route across in-game zones. Recipe/gathering data comes **live from XIVAPI v2**
 (HTML + CSS + vanilla JS) is embedded as one big triple-quoted `HTML` string
 near the bottom of `app.py`; there is no bundler, framework, or build step.
 
-Dependencies: `flask`, `requests` (runtime). `pytest` (dev). That's it.
+Dependencies: `flask`, `requests`, `authlib` (runtime, all pip). `pytest`
+(dev). Persistence is stdlib `sqlite3` — no extra dependency.
 
 ## Running
 
@@ -19,6 +20,10 @@ Dependencies: `flask`, `requests` (runtime). `pytest` (dev). That's it.
 - Preview/verify: `.claude/launch.json` defines the `ffxiv-craft` server for the
   browser preview tools. Prefer that over spawning `python app.py` by hand.
 - Needs internet (calls XIVAPI).
+- **Auth/persistence env vars** (all optional locally): `FLASK_SECRET_KEY`,
+  `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`. Set `AUTH_DISABLED=1` to run
+  without a Google OAuth client — the app then uses a single `local` user
+  and the Library/history work offline. See "Persistence & auth" below.
 
 ## Testing & CI
 
@@ -26,6 +31,10 @@ Dependencies: `flask`, `requests` (runtime). `pytest` (dev). That's it.
 - Tests live in `tests/`; **all XIVAPI calls are mocked** through the single
   `xiv_get()` seam (see `tests/conftest.py`). Never hit the live API in tests.
 - CI: `.github/workflows/ci.yml` runs pytest on Python 3.10–3.12.
+- Persistence tests use the `temp_db` fixture (a throwaway SQLite file per
+  test). The suite defaults to `AUTH_DISABLED` (autouse fixture); auth-gating
+  tests opt back in with `auth_enabled` and stamp the Flask session directly
+  — no live Google calls.
 
 ## ⚠️ Editing `app.py` — CRLF line endings
 
@@ -59,10 +68,18 @@ so any **multi-line** `old_string` fails with "String to replace not found".
 - **Endpoints**: `/`, `/api/search`, `/api/breakdown` (single target),
   `/api/breakdown_multi` (list of targets, aggregated), `/api/route`,
   `/api/lookup_zones`, and several `/api/debug/*` helpers.
+- **Persistence + auth**: `db()` (SQLite conn context-manager, lazy schema),
+  `get_or_create_user`, `get_current_user_id` (the ONE auth seam — returns
+  the session user, or the `local` placeholder when `AUTH_DISABLED`),
+  `record_search`/`recent_searches`, `save_route`/`list_saved_routes`/
+  `get_saved_route`/`delete_saved_route`. Endpoints: `/api/me`, `/login`,
+  `/auth/callback`, `/logout`, `/api/history`, `/api/routes` (+ `/<id>`).
 - **Embedded HTML/JS**: the `HTML` string. Frontend state is the `S` object
   (`S.targets` = items to craft; `S.neededItems` = derived route input).
   Key JS: `addTarget`/`renderTargets`, `setRouteItems`, `renderMultiBreakdown`,
-  `renderTree`, `renderChecklist`/`renderTotals`, `renderRouteSection`/`renderRoute`.
+  `renderTree`, `renderChecklist`/`renderTotals`, `renderRouteSection`/`renderRoute`;
+  `initAuth`/`renderAuth` (header control + Library gating),
+  `loadSavedRoutes`/`loadHistory`/`saveCurrentRoute`/`loadRoute` (Library panel).
 
 ## XIVAPI v2 quirks (hard-won — don't regress these)
 
@@ -88,8 +105,30 @@ so any **multi-line** `old_string` fails with "String to replace not found".
 - Keep the app single-file and dependency-light unless a change warrants otherwise.
 - Match the surrounding vanilla-JS style in the `HTML` string (no framework).
 
+## Persistence & auth
+
+Per-user **search history** and **saved routes** persist in a local SQLite
+file (`ffxiv_craft.db`, stdlib `sqlite3`, created lazily on first run,
+gitignored). Everything is keyed by an internal user id via
+`get_current_user_id()` — the single seam:
+
+- With `AUTH_DISABLED=1` (local dev / offline / tests) it returns one `local`
+  placeholder user, so the Library works without any OAuth setup.
+- Otherwise it reads the Flask session set by **Authlib "Sign in with
+  Google"** (`/login` → Google → `/auth/callback` stores `google:{sub}` as
+  the user's `external_id`). Persistence endpoints return **401** when nobody
+  is signed in.
+
+To enable real sign-in, set `FLASK_SECRET_KEY`, `GOOGLE_CLIENT_ID`, and
+`GOOGLE_CLIENT_SECRET` (a Google Cloud OAuth *Web* client; redirect URI
+`<host>/auth/callback`). Without those the server still runs but `/login`
+returns 503. When adding auth-aware code, keep `get_current_user_id()` the
+only place identity is resolved.
+
 ## Direction
 
-Headed for **hosted, multi-user** with per-user saved history/routes. Auth +
-datastore is a planned separate project (lean Authlib Google OAuth or Supabase
-over Firebase for this no-build app; SQLite for local/low-scale persistence).
+Next up for **hosted, multi-user**: pick a host and a production datastore.
+SQLite is fine for local/low-scale; move to managed Postgres (e.g. Supabase,
+which could also replace the auth layer) if/when scale or hosting warrants.
+Firebase remains the heaviest fit — the frontend is vanilla JS in a Python
+string with no build step.

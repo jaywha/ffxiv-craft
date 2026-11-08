@@ -2,3 +2,9 @@
 .vscode
 __pycache__/
 .pytest_cache/
+
+# SQLite datastore (created lazily on first run)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
