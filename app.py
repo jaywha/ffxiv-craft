@@ -1,5 +1,5 @@
 from flask import Flask, jsonify, request, Response, session, redirect, url_for
-import requests, math, itertools, sqlite3, os, json
+import requests, math, itertools, sqlite3, os, json, time
 from contextlib import contextmanager
 from authlib.integrations.flask_client import OAuth
 
@@ -32,10 +32,105 @@ SESSION.headers.update({"User-Agent": "ffxiv-craft-planner/1.0"})
 
 XIV_BASE = "https://v2.xivapi.com/api"
 
-def xiv_get(path, params=None, timeout=10):
-    r = SESSION.get(f"{XIV_BASE}{path}", params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+# Network resilience knobs. XIVAPI v2 is a community service: transient 5xx,
+# dropped connections and rate-limit (429) responses are routine, and a single
+# recipe breakdown fans out into dozens of sequential calls -- so one blip must
+# not sink the whole operation.
+XIV_TIMEOUT = (3.05, 10)   # (connect, read) seconds
+XIV_MAX_RETRIES = 3        # attempts = 1 + this many retries on transient fails
+XIV_BACKOFF_BASE = 0.5     # seconds, doubled each retry (0.5, 1.0, 2.0, ...)
+XIV_RETRY_STATUS = {429, 500, 502, 503, 504}
+
+# Process-level cache of successful responses. XIVAPI rows and search results
+# are reference data that only changes on game patches, so caching across
+# requests is safe and cuts latency, load, and transient-error exposure.
+# Bounded with a simple FIFO cap to stay flat in a long-lived multi-user process.
+XIV_CACHE_ENABLED = True
+XIV_CACHE_MAX = 4096
+_XIV_CACHE = {}
+
+
+class XIVUnavailable(Exception):
+    """Raised when XIVAPI could not be reached after retries (network down,
+    timeouts, or repeated 5xx/429). Distinct from a 4xx, which is a definitive
+    answer (e.g. a missing row) and is never retried. Callers that can degrade
+    gracefully catch this; the breakdown endpoints turn it into a 503."""
+
+
+def _xiv_cache_key(path, params):
+    return (path, tuple(sorted((params or {}).items())))
+
+
+def _xiv_cache_clear():
+    _XIV_CACHE.clear()
+
+
+def _xiv_cache_store(key, data):
+    if len(_XIV_CACHE) >= XIV_CACHE_MAX:
+        # FIFO eviction: drop the oldest inserted entry (dicts keep insert order)
+        try:
+            _XIV_CACHE.pop(next(iter(_XIV_CACHE)))
+        except StopIteration:
+            pass
+    _XIV_CACHE[key] = data
+
+
+def _retry_after_seconds(resp):
+    """Seconds to wait from a Retry-After header (numeric form), clamped so a
+    hostile or huge value can't stall the request. None if absent/unparseable."""
+    val = resp.headers.get("Retry-After")
+    if not val:
+        return None
+    try:
+        secs = float(val)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(secs, 10.0))
+
+
+def xiv_get(path, params=None, timeout=None):
+    """GET a XIVAPI v2 JSON resource, with caching + bounded retry/backoff.
+
+    Retries only *transient* failures -- connection errors, timeouts, and
+    429/5xx responses -- with exponential backoff (honoring Retry-After on a
+    429 when present). A 4xx other than 429 is deterministic (e.g. the
+    documented +Item[]= 400, or a missing row) and is raised immediately. When
+    retries are exhausted the last error is wrapped in XIVUnavailable."""
+    if timeout is None:
+        timeout = XIV_TIMEOUT
+    key = _xiv_cache_key(path, params)
+    if XIV_CACHE_ENABLED and key in _XIV_CACHE:
+        return _XIV_CACHE[key]
+
+    url = f"{XIV_BASE}{path}"
+    last_exc = None
+    for attempt in range(XIV_MAX_RETRIES + 1):
+        retry_after = None
+        try:
+            r = SESSION.get(url, params=params, timeout=timeout)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_exc = e  # transient: fall through to backoff/retry
+        else:
+            if r.status_code in XIV_RETRY_STATUS:
+                last_exc = requests.HTTPError(
+                    f"{r.status_code} Server Error for {path}", response=r)
+                retry_after = _retry_after_seconds(r)
+            elif r.status_code >= 400:
+                r.raise_for_status()  # deterministic 4xx: never retried
+            else:
+                data = r.json()
+                if XIV_CACHE_ENABLED:
+                    _xiv_cache_store(key, data)
+                return data
+
+        if attempt < XIV_MAX_RETRIES:
+            delay = (retry_after if retry_after is not None
+                     else XIV_BACKOFF_BASE * (2 ** attempt))
+            time.sleep(delay)
+
+    raise XIVUnavailable(
+        f"XIVAPI unreachable for {path} after "
+        f"{XIV_MAX_RETRIES + 1} attempt(s): {last_exc}")
 
 def icon_url(icon_field):
     if not icon_field:
@@ -800,6 +895,8 @@ def _fetch_info(iid, cache):
     if iid not in cache:
         try:
             cache[iid] = get_item_info(iid)
+        except XIVUnavailable:
+            raise  # a real outage must not masquerade as a nameless item
         except Exception:
             cache[iid] = {"id": iid, "name": f"Item {iid}", "icon": None, "ui_category": ""}
     return cache[iid]
@@ -809,20 +906,33 @@ def _fetch_recipe(iid, cache):
     if iid not in cache:
         try:
             cache[iid] = find_recipe(iid)
+        except XIVUnavailable:
+            raise  # don't cache an outage as "no recipe" -> silent wrong tree
         except Exception:
             cache[iid] = None
     return cache[iid]
 
 
-def build_material_tree(item_id, quantity, have_items, item_cache, recipe_cache, raw_materials):
+def build_material_tree(item_id, quantity, have_items, item_cache, recipe_cache, raw_materials, warnings=None):
     """Expand item_id into an ingredient tree, accumulating leaf/raw materials
     into raw_materials. raw_materials sums total_needed across calls, so several
-    targets can share one dict to aggregate their shared materials."""
+    targets can share one dict to aggregate their shared materials.
+
+    `warnings` (a shared list) collects items whose recipe lookup failed
+    transiently, so the caller can flag a partial breakdown instead of
+    silently dropping sub-trees."""
+    if warnings is None:
+        warnings = []
+
     def build(iid, qty_needed, depth=0, ing_name=None, ing_icon=None, ing_cat=""):
         have      = have_items.get(str(iid), 0)
         qty_after = max(0, qty_needed - have)
 
-        recipe     = _fetch_recipe(iid, recipe_cache)
+        try:
+            recipe = _fetch_recipe(iid, recipe_cache)
+            recipe_unavailable = False
+        except XIVUnavailable:
+            recipe, recipe_unavailable = None, True
         has_recipe = bool(recipe and recipe.get("ingredients"))
 
         if ing_name:
@@ -843,6 +953,15 @@ def build_material_tree(item_id, quantity, have_items, item_cache, recipe_cache,
 
         if qty_after == 0:
             node["is_leaf"] = True
+            return node
+
+        if recipe_unavailable:
+            # Couldn't tell whether this is craftable (XIVAPI outage mid-walk).
+            # Flag and stop here -- a visible gap beats a silently wrong tree.
+            node["is_leaf"] = True
+            node["degraded"] = True
+            node["source"] = "unknown"
+            warnings.append({"item_id": iid, "name": name, "reason": "lookup_failed"})
             return node
 
         if not has_recipe:
@@ -892,11 +1011,17 @@ def api_breakdown():
     quantity   = int(body.get("quantity", 1))
     have_items = {str(k): int(v) for k, v in body.get("have_items", {}).items()}
 
-    item_cache, recipe_cache, raw_materials = {}, {}, {}
-    tree = build_material_tree(item_id, quantity, have_items,
-                               item_cache, recipe_cache, raw_materials)
+    item_cache, recipe_cache, raw_materials, warnings = {}, {}, {}, []
+    try:
+        tree = build_material_tree(item_id, quantity, have_items,
+                                   item_cache, recipe_cache, raw_materials, warnings)
+    except XIVUnavailable as e:
+        return jsonify({"error": "XIVAPI is currently unreachable; please try again.",
+                        "detail": str(e)}), 503
     grouped = group_materials(raw_materials)
-    return jsonify({"tree": tree, "raw_materials": raw_materials, "grouped_materials": grouped})
+    return jsonify({"tree": tree, "raw_materials": raw_materials,
+                    "grouped_materials": grouped,
+                    "warnings": warnings, "partial": bool(warnings)})
 
 
 @app.route("/api/breakdown_multi", methods=["POST"])
@@ -910,25 +1035,30 @@ def api_breakdown_multi():
     targets = body.get("targets", [])
     have_items = {str(k): int(v) for k, v in body.get("have_items", {}).items()}
 
-    item_cache, recipe_cache, raw_materials = {}, {}, {}
+    item_cache, recipe_cache, raw_materials, warnings = {}, {}, {}, []
     out_targets = []
-    for t in targets:
-        try:
-            iid = int(t["item_id"])
-            qty = int(t.get("quantity", 1))
-        except (KeyError, TypeError, ValueError):
-            continue
-        if qty < 1:
-            continue
-        tree = build_material_tree(iid, qty, have_items,
-                                   item_cache, recipe_cache, raw_materials)
-        info = _fetch_info(iid, item_cache)
-        out_targets.append({"item_id": iid, "name": info["name"],
-                            "icon": info["icon"], "quantity": qty, "tree": tree})
+    try:
+        for t in targets:
+            try:
+                iid = int(t["item_id"])
+                qty = int(t.get("quantity", 1))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if qty < 1:
+                continue
+            tree = build_material_tree(iid, qty, have_items,
+                                       item_cache, recipe_cache, raw_materials, warnings)
+            info = _fetch_info(iid, item_cache)
+            out_targets.append({"item_id": iid, "name": info["name"],
+                                "icon": info["icon"], "quantity": qty, "tree": tree})
+    except XIVUnavailable as e:
+        return jsonify({"error": "XIVAPI is currently unreachable; please try again.",
+                        "detail": str(e)}), 503
 
     grouped = group_materials(raw_materials)
     return jsonify({"targets": out_targets, "raw_materials": raw_materials,
-                    "grouped_materials": grouped})
+                    "grouped_materials": grouped,
+                    "warnings": warnings, "partial": bool(warnings)})
 
 
 def _candidate_zones(zone_hints):
@@ -1276,6 +1406,9 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .empty{text-align:center;color:var(--text3);font-size:12px;padding:16px;font-style:italic}
 .status-bar{font-size:12px;color:var(--text3);display:flex;align-items:center;padding:8px 20px;border-bottom:1px solid var(--border);min-height:36px;background:var(--bg2)}
 .err{color:var(--red)}
+.warn-banner{display:flex;gap:10px;align-items:flex-start;background:var(--gold-dim);border:1px solid var(--gold);border-radius:var(--r);padding:11px 14px;margin-bottom:14px;font-size:12.5px;line-height:1.6;color:var(--gold2)}
+.warn-banner .warn-ico{color:var(--gold);font-size:15px;flex-shrink:0;line-height:1.4}
+.warn-banner strong{color:var(--text)}
 .spin{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--gold);border-radius:50%;animation:spin .6s linear infinite;display:inline-block;vertical-align:middle;margin-right:8px;flex-shrink:0}
 @keyframes spin{to{transform:rotate(360deg)}}
 .sec-title{font-family:'Cinzel',serif;font-size:13px;letter-spacing:.12em;color:var(--gold);text-transform:uppercase;border-bottom:1px solid var(--border);padding-bottom:10px;margin-bottom:14px}
@@ -1614,6 +1747,11 @@ $('bb').onclick = async function() {
       body: JSON.stringify({targets: S.targets.map(t => ({item_id: t.id, quantity: t.qty}))})
     });
     const d = await r.json();
+    if (!r.ok) {
+      setStatus((d && d.error) || 'Breakdown failed.', true);
+      $('bb').disabled = false;
+      return;
+    }
     S.lastGrouped = d.grouped_materials;
     S.lastRaw = d.raw_materials;
     setStatus('');
@@ -1646,6 +1784,20 @@ function renderMultiBreakdown(data) {
       <div class="tc" id="tab-tot"></div>
     </div>
     <div id="route-section-container"></div>`;
+
+  if (data.partial && Array.isArray(data.warnings) && data.warnings.length) {
+    const names = data.warnings.map(w => w.name || ('Item ' + w.item_id));
+    const uniq = [...new Set(names)];
+    const shown = uniq.slice(0, 6).join(', ') + (uniq.length > 6 ? `, +${uniq.length - 6} more` : '');
+    const banner = document.createElement('div');
+    banner.className = 'warn-banner';
+    banner.innerHTML = `<span class="warn-ico">&#9888;</span>`
+      + `<span>Partial result \u2014 couldn't load recipe data for ${uniq.length} item`
+      + `${uniq.length !== 1 ? 's' : ''} (XIVAPI may be rate-limiting or down). `
+      + `Shown unexpanded, so sub-materials may be missing: <strong>${shown}</strong>. `
+      + `Try again shortly for a complete breakdown.</span>`;
+    ma.insertBefore(banner, ma.firstChild);
+  }
 
   ma.querySelectorAll('.tab').forEach(t => t.onclick = () => {
     ma.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));

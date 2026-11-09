@@ -50,7 +50,12 @@ so any **multi-line** `old_string` fails with "String to replace not found".
 
 ## Code map (`app.py`, top to bottom)
 
-- **XIVAPI helpers**: `xiv_get` (the one network seam — mock this), `icon_url`,
+- **XIVAPI helpers**: `xiv_get` (the one network seam — mock this). Retries
+  transient failures (connection errors, timeouts, 429, 5xx) with bounded
+  exponential backoff (honoring `Retry-After`); **never** retries a 4xx (the
+  `+Item[]=` 400 and missing rows are deterministic); caches successful GETs
+  process-wide (`_XIV_CACHE`, FIFO-capped — reference data is patch-stable);
+  raises **`XIVUnavailable`** when the API stays unreachable. Also `icon_url`,
   `search_items_xiv`, `find_recipe`, `parse_recipe`, `get_item_info`,
   `classify` (keyword heuristic → gathered / crystal / crafted / other).
 - **Gathering lookup**: `get_gathering_locations` + `_extract_exported_point` +
@@ -98,6 +103,14 @@ so any **multi-line** `old_string` fails with "String to replace not found".
   fold-in (they don't force route stops).
 - `GatheringPointBase.Item[]` mixes `GatheringItem` and `SpearfishingItem` rows
   — filter by the row's `sheet`/value when scanning.
+- **A transient outage must never corrupt a breakdown.** `_fetch_info` /
+  `_fetch_recipe` let `XIVUnavailable` propagate (they only swallow definitive
+  "no data"). If a recipe lookup fails mid-walk, `build_material_tree` marks that
+  node `degraded` / `source:"unknown"`, appends to the shared `warnings` list, and
+  stops — it does **not** silently treat the item as a raw material. The
+  `/api/breakdown(_multi)` endpoints return `{partial, warnings}` (frontend shows
+  an amber banner) and a **503** when the API is fully unreachable. Caching a
+  failed lookup as `None` would otherwise read as "no recipe" → a wrong list.
 
 ## Conventions
 
